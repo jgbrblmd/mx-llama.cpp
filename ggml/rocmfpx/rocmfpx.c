@@ -1,0 +1,452 @@
+#include "rocmfpx.h"
+
+#include <assert.h>
+#include <math.h>
+#include <string.h>
+
+// Finite unsigned E4M3 scale bytes decoded to FP32. Precomputed from the same
+// exp/mant formula used to evaluate with ldexpf():
+//   exp == 0 -> mant * 2^-10 ; otherwise (8 + mant) * 2^(exp - 11).
+#define ROCMFPX_SCALE_SUB(M) ((M) * 0x1p-10f)
+#define ROCMFPX_SCALE_E(B, M) ((8 + (M)) * (B))
+
+static const float rocmfpx_scale_ue4m3[127] = {
+    ROCMFPX_SCALE_SUB(0),      ROCMFPX_SCALE_SUB(1),      ROCMFPX_SCALE_SUB(2),      ROCMFPX_SCALE_SUB(3),
+    ROCMFPX_SCALE_SUB(4),      ROCMFPX_SCALE_SUB(5),      ROCMFPX_SCALE_SUB(6),      ROCMFPX_SCALE_SUB(7),
+    ROCMFPX_SCALE_E(0x1p-10f,0), ROCMFPX_SCALE_E(0x1p-10f,1), ROCMFPX_SCALE_E(0x1p-10f,2), ROCMFPX_SCALE_E(0x1p-10f,3),
+    ROCMFPX_SCALE_E(0x1p-10f,4), ROCMFPX_SCALE_E(0x1p-10f,5), ROCMFPX_SCALE_E(0x1p-10f,6), ROCMFPX_SCALE_E(0x1p-10f,7),
+    ROCMFPX_SCALE_E(0x1p-9f,0),  ROCMFPX_SCALE_E(0x1p-9f,1),  ROCMFPX_SCALE_E(0x1p-9f,2),  ROCMFPX_SCALE_E(0x1p-9f,3),
+    ROCMFPX_SCALE_E(0x1p-9f,4),  ROCMFPX_SCALE_E(0x1p-9f,5),  ROCMFPX_SCALE_E(0x1p-9f,6),  ROCMFPX_SCALE_E(0x1p-9f,7),
+    ROCMFPX_SCALE_E(0x1p-8f,0),  ROCMFPX_SCALE_E(0x1p-8f,1),  ROCMFPX_SCALE_E(0x1p-8f,2),  ROCMFPX_SCALE_E(0x1p-8f,3),
+    ROCMFPX_SCALE_E(0x1p-8f,4),  ROCMFPX_SCALE_E(0x1p-8f,5),  ROCMFPX_SCALE_E(0x1p-8f,6),  ROCMFPX_SCALE_E(0x1p-8f,7),
+    ROCMFPX_SCALE_E(0x1p-7f,0),  ROCMFPX_SCALE_E(0x1p-7f,1),  ROCMFPX_SCALE_E(0x1p-7f,2),  ROCMFPX_SCALE_E(0x1p-7f,3),
+    ROCMFPX_SCALE_E(0x1p-7f,4),  ROCMFPX_SCALE_E(0x1p-7f,5),  ROCMFPX_SCALE_E(0x1p-7f,6),  ROCMFPX_SCALE_E(0x1p-7f,7),
+    ROCMFPX_SCALE_E(0x1p-6f,0),  ROCMFPX_SCALE_E(0x1p-6f,1),  ROCMFPX_SCALE_E(0x1p-6f,2),  ROCMFPX_SCALE_E(0x1p-6f,3),
+    ROCMFPX_SCALE_E(0x1p-6f,4),  ROCMFPX_SCALE_E(0x1p-6f,5),  ROCMFPX_SCALE_E(0x1p-6f,6),  ROCMFPX_SCALE_E(0x1p-6f,7),
+    ROCMFPX_SCALE_E(0x1p-5f,0),  ROCMFPX_SCALE_E(0x1p-5f,1),  ROCMFPX_SCALE_E(0x1p-5f,2),  ROCMFPX_SCALE_E(0x1p-5f,3),
+    ROCMFPX_SCALE_E(0x1p-5f,4),  ROCMFPX_SCALE_E(0x1p-5f,5),  ROCMFPX_SCALE_E(0x1p-5f,6),  ROCMFPX_SCALE_E(0x1p-5f,7),
+    ROCMFPX_SCALE_E(0x1p-4f,0),  ROCMFPX_SCALE_E(0x1p-4f,1),  ROCMFPX_SCALE_E(0x1p-4f,2),  ROCMFPX_SCALE_E(0x1p-4f,3),
+    ROCMFPX_SCALE_E(0x1p-4f,4),  ROCMFPX_SCALE_E(0x1p-4f,5),  ROCMFPX_SCALE_E(0x1p-4f,6),  ROCMFPX_SCALE_E(0x1p-4f,7),
+    ROCMFPX_SCALE_E(0x1p-3f,0),  ROCMFPX_SCALE_E(0x1p-3f,1),  ROCMFPX_SCALE_E(0x1p-3f,2),  ROCMFPX_SCALE_E(0x1p-3f,3),
+    ROCMFPX_SCALE_E(0x1p-3f,4),  ROCMFPX_SCALE_E(0x1p-3f,5),  ROCMFPX_SCALE_E(0x1p-3f,6),  ROCMFPX_SCALE_E(0x1p-3f,7),
+    ROCMFPX_SCALE_E(0x1p-2f,0),  ROCMFPX_SCALE_E(0x1p-2f,1),  ROCMFPX_SCALE_E(0x1p-2f,2),  ROCMFPX_SCALE_E(0x1p-2f,3),
+    ROCMFPX_SCALE_E(0x1p-2f,4),  ROCMFPX_SCALE_E(0x1p-2f,5),  ROCMFPX_SCALE_E(0x1p-2f,6),  ROCMFPX_SCALE_E(0x1p-2f,7),
+    ROCMFPX_SCALE_E(0x1p-1f,0),  ROCMFPX_SCALE_E(0x1p-1f,1),  ROCMFPX_SCALE_E(0x1p-1f,2),  ROCMFPX_SCALE_E(0x1p-1f,3),
+    ROCMFPX_SCALE_E(0x1p-1f,4),  ROCMFPX_SCALE_E(0x1p-1f,5),  ROCMFPX_SCALE_E(0x1p-1f,6),  ROCMFPX_SCALE_E(0x1p-1f,7),
+    ROCMFPX_SCALE_E(0x1p0f,0),   ROCMFPX_SCALE_E(0x1p0f,1),   ROCMFPX_SCALE_E(0x1p0f,2),   ROCMFPX_SCALE_E(0x1p0f,3),
+    ROCMFPX_SCALE_E(0x1p0f,4),   ROCMFPX_SCALE_E(0x1p0f,5),   ROCMFPX_SCALE_E(0x1p0f,6),   ROCMFPX_SCALE_E(0x1p0f,7),
+    ROCMFPX_SCALE_E(0x1p1f,0),   ROCMFPX_SCALE_E(0x1p1f,1),   ROCMFPX_SCALE_E(0x1p1f,2),   ROCMFPX_SCALE_E(0x1p1f,3),
+    ROCMFPX_SCALE_E(0x1p1f,4),   ROCMFPX_SCALE_E(0x1p1f,5),   ROCMFPX_SCALE_E(0x1p1f,6),   ROCMFPX_SCALE_E(0x1p1f,7),
+    ROCMFPX_SCALE_E(0x1p2f,0),   ROCMFPX_SCALE_E(0x1p2f,1),   ROCMFPX_SCALE_E(0x1p2f,2),   ROCMFPX_SCALE_E(0x1p2f,3),
+    ROCMFPX_SCALE_E(0x1p2f,4),   ROCMFPX_SCALE_E(0x1p2f,5),   ROCMFPX_SCALE_E(0x1p2f,6),   ROCMFPX_SCALE_E(0x1p2f,7),
+    ROCMFPX_SCALE_E(0x1p3f,0),   ROCMFPX_SCALE_E(0x1p3f,1),   ROCMFPX_SCALE_E(0x1p3f,2),   ROCMFPX_SCALE_E(0x1p3f,3),
+    ROCMFPX_SCALE_E(0x1p3f,4),   ROCMFPX_SCALE_E(0x1p3f,5),   ROCMFPX_SCALE_E(0x1p3f,6),   ROCMFPX_SCALE_E(0x1p3f,7),
+    ROCMFPX_SCALE_E(0x1p4f,0),   ROCMFPX_SCALE_E(0x1p4f,1),   ROCMFPX_SCALE_E(0x1p4f,2),   ROCMFPX_SCALE_E(0x1p4f,3),
+    ROCMFPX_SCALE_E(0x1p4f,4),   ROCMFPX_SCALE_E(0x1p4f,5),   ROCMFPX_SCALE_E(0x1p4f,6),
+};
+
+#undef ROCMFPX_SCALE_SUB
+#undef ROCMFPX_SCALE_E
+
+float rocmfpx_ue4m3_to_fp32(uint8_t e) {
+    return rocmfpx_scale_is_valid(e) ? rocmfpx_scale_ue4m3[e] : 0.0f;
+}
+
+bool rocmfpx_scale_is_valid(uint8_t e) {
+    return e <= 0x7e;
+}
+
+// Precomputed table of all 127 valid UE4M3 scale values (e = 0x00..0x7e).
+#define ROCMFPX_SCALE_SUB(M) ((M) * 0x1p-10f)
+#define ROCMFPX_SCALE_E1(M)  ((8 + (M)) * 0x1p-10f)
+#define ROCMFPX_SCALE_E2(M)  ((8 + (M)) * 0x1p-9f)
+#define ROCMFPX_SCALE_E3(M)  ((8 + (M)) * 0x1p-8f)
+#define ROCMFPX_SCALE_E4(M)  ((8 + (M)) * 0x1p-7f)
+#define ROCMFPX_SCALE_E5(M)  ((8 + (M)) * 0x1p-6f)
+#define ROCMFPX_SCALE_E6(M)  ((8 + (M)) * 0x1p-5f)
+#define ROCMFPX_SCALE_E7(M)  ((8 + (M)) * 0x1p-4f)
+#define ROCMFPX_SCALE_E8(M)  ((8 + (M)) * 0x1p-3f)
+#define ROCMFPX_SCALE_E9(M)  ((8 + (M)) * 0x1p-2f)
+#define ROCMFPX_SCALE_E10(M) ((8 + (M)) * 0x1p-1f)
+#define ROCMFPX_SCALE_E11(M) ((8 + (M)) * 0x1p0f)
+#define ROCMFPX_SCALE_E12(M) ((8 + (M)) * 0x1p1f)
+#define ROCMFPX_SCALE_E13(M) ((8 + (M)) * 0x1p2f)
+#define ROCMFPX_SCALE_E14(M) ((8 + (M)) * 0x1p3f)
+#define ROCMFPX_SCALE_E15(M) ((8 + (M)) * 0x1p4f)
+
+static const float rocmfpx_scale_table[127] = {
+    ROCMFPX_SCALE_SUB(0), ROCMFPX_SCALE_SUB(1), ROCMFPX_SCALE_SUB(2), ROCMFPX_SCALE_SUB(3),
+    ROCMFPX_SCALE_SUB(4), ROCMFPX_SCALE_SUB(5), ROCMFPX_SCALE_SUB(6), ROCMFPX_SCALE_SUB(7),
+    ROCMFPX_SCALE_E1(0),  ROCMFPX_SCALE_E1(1),  ROCMFPX_SCALE_E1(2),  ROCMFPX_SCALE_E1(3),
+    ROCMFPX_SCALE_E1(4),  ROCMFPX_SCALE_E1(5),  ROCMFPX_SCALE_E1(6),  ROCMFPX_SCALE_E1(7),
+    ROCMFPX_SCALE_E2(0),  ROCMFPX_SCALE_E2(1),  ROCMFPX_SCALE_E2(2),  ROCMFPX_SCALE_E2(3),
+    ROCMFPX_SCALE_E2(4),  ROCMFPX_SCALE_E2(5),  ROCMFPX_SCALE_E2(6),  ROCMFPX_SCALE_E2(7),
+    ROCMFPX_SCALE_E3(0),  ROCMFPX_SCALE_E3(1),  ROCMFPX_SCALE_E3(2),  ROCMFPX_SCALE_E3(3),
+    ROCMFPX_SCALE_E3(4),  ROCMFPX_SCALE_E3(5),  ROCMFPX_SCALE_E3(6),  ROCMFPX_SCALE_E3(7),
+    ROCMFPX_SCALE_E4(0),  ROCMFPX_SCALE_E4(1),  ROCMFPX_SCALE_E4(2),  ROCMFPX_SCALE_E4(3),
+    ROCMFPX_SCALE_E4(4),  ROCMFPX_SCALE_E4(5),  ROCMFPX_SCALE_E4(6),  ROCMFPX_SCALE_E4(7),
+    ROCMFPX_SCALE_E5(0),  ROCMFPX_SCALE_E5(1),  ROCMFPX_SCALE_E5(2),  ROCMFPX_SCALE_E5(3),
+    ROCMFPX_SCALE_E5(4),  ROCMFPX_SCALE_E5(5),  ROCMFPX_SCALE_E5(6),  ROCMFPX_SCALE_E5(7),
+    ROCMFPX_SCALE_E6(0),  ROCMFPX_SCALE_E6(1),  ROCMFPX_SCALE_E6(2),  ROCMFPX_SCALE_E6(3),
+    ROCMFPX_SCALE_E6(4),  ROCMFPX_SCALE_E6(5),  ROCMFPX_SCALE_E6(6),  ROCMFPX_SCALE_E6(7),
+    ROCMFPX_SCALE_E7(0),  ROCMFPX_SCALE_E7(1),  ROCMFPX_SCALE_E7(2),  ROCMFPX_SCALE_E7(3),
+    ROCMFPX_SCALE_E7(4),  ROCMFPX_SCALE_E7(5),  ROCMFPX_SCALE_E7(6),  ROCMFPX_SCALE_E7(7),
+    ROCMFPX_SCALE_E8(0),  ROCMFPX_SCALE_E8(1),  ROCMFPX_SCALE_E8(2),  ROCMFPX_SCALE_E8(3),
+    ROCMFPX_SCALE_E8(4),  ROCMFPX_SCALE_E8(5),  ROCMFPX_SCALE_E8(6),  ROCMFPX_SCALE_E8(7),
+    ROCMFPX_SCALE_E9(0),  ROCMFPX_SCALE_E9(1),  ROCMFPX_SCALE_E9(2),  ROCMFPX_SCALE_E9(3),
+    ROCMFPX_SCALE_E9(4),  ROCMFPX_SCALE_E9(5),  ROCMFPX_SCALE_E9(6),  ROCMFPX_SCALE_E9(7),
+    ROCMFPX_SCALE_E10(0), ROCMFPX_SCALE_E10(1), ROCMFPX_SCALE_E10(2), ROCMFPX_SCALE_E10(3),
+    ROCMFPX_SCALE_E10(4), ROCMFPX_SCALE_E10(5), ROCMFPX_SCALE_E10(6), ROCMFPX_SCALE_E10(7),
+    ROCMFPX_SCALE_E11(0), ROCMFPX_SCALE_E11(1), ROCMFPX_SCALE_E11(2), ROCMFPX_SCALE_E11(3),
+    ROCMFPX_SCALE_E11(4), ROCMFPX_SCALE_E11(5), ROCMFPX_SCALE_E11(6), ROCMFPX_SCALE_E11(7),
+    ROCMFPX_SCALE_E12(0), ROCMFPX_SCALE_E12(1), ROCMFPX_SCALE_E12(2), ROCMFPX_SCALE_E12(3),
+    ROCMFPX_SCALE_E12(4), ROCMFPX_SCALE_E12(5), ROCMFPX_SCALE_E12(6), ROCMFPX_SCALE_E12(7),
+    ROCMFPX_SCALE_E13(0), ROCMFPX_SCALE_E13(1), ROCMFPX_SCALE_E13(2), ROCMFPX_SCALE_E13(3),
+    ROCMFPX_SCALE_E13(4), ROCMFPX_SCALE_E13(5), ROCMFPX_SCALE_E13(6), ROCMFPX_SCALE_E13(7),
+    ROCMFPX_SCALE_E14(0), ROCMFPX_SCALE_E14(1), ROCMFPX_SCALE_E14(2), ROCMFPX_SCALE_E14(3),
+    ROCMFPX_SCALE_E14(4), ROCMFPX_SCALE_E14(5), ROCMFPX_SCALE_E14(6), ROCMFPX_SCALE_E14(7),
+    ROCMFPX_SCALE_E15(0), ROCMFPX_SCALE_E15(1), ROCMFPX_SCALE_E15(2), ROCMFPX_SCALE_E15(3),
+    ROCMFPX_SCALE_E15(4), ROCMFPX_SCALE_E15(5), ROCMFPX_SCALE_E15(6),
+};
+
+#undef ROCMFPX_SCALE_SUB
+#undef ROCMFPX_SCALE_E1
+#undef ROCMFPX_SCALE_E2
+#undef ROCMFPX_SCALE_E3
+#undef ROCMFPX_SCALE_E4
+#undef ROCMFPX_SCALE_E5
+#undef ROCMFPX_SCALE_E6
+#undef ROCMFPX_SCALE_E7
+#undef ROCMFPX_SCALE_E8
+#undef ROCMFPX_SCALE_E9
+#undef ROCMFPX_SCALE_E10
+#undef ROCMFPX_SCALE_E11
+#undef ROCMFPX_SCALE_E12
+#undef ROCMFPX_SCALE_E13
+#undef ROCMFPX_SCALE_E14
+#undef ROCMFPX_SCALE_E15
+
+static inline float rocmfpx_scale_lookup(uint8_t e) {
+    return e <= 0x7e ? rocmfpx_scale_table[e] : 0.0f;
+}
+
+static uint8_t rocmfpx_nearest_scale_ue4m3(float target) {
+    if (!(target > 0.0f) || !isfinite(target)) {
+        return 0;
+    }
+
+    int lo = 1;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (rocmfpx_scale_table[mid] < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo == 1) {
+        return 1;
+    }
+
+    const float hi_scale = rocmfpx_scale_table[lo];
+    const float lo_scale = rocmfpx_scale_table[lo - 1];
+
+    return (target - lo_scale <= hi_scale - target) ? (uint8_t)(lo - 1) : (uint8_t) lo;
+}
+
+static float rocmfpx_max_abs(const float * x, int n) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+        const float ax = fabsf(x[i]);
+        if (ax > max_abs) {
+            max_abs = ax;
+        }
+    }
+    return max_abs;
+}
+
+// ---------------------------------------------------------------------------
+// FP6 helpers
+// ---------------------------------------------------------------------------
+
+// Pack 4 unsigned 6-bit codes into 3 bytes.
+//   byte 0: [v0 5:0]
+//   byte 1: [v0 1:0][v1 5:2]
+//   byte 2: [v1 1:0][v2 5:0]
+//   byte 3: [v2 1:0][v3 5:0]  -- not used in the 3-byte output
+// Actually the layout is:
+//   byte 0: [v0 5:0]
+//   byte 1: [v0 1:0][v1 5:2]  -- wait, let me re-read the original
+// The original pack4:
+//   dst[0] = (c[0] & 0x3f) | ((c[1] & 0x03) << 6)
+//   dst[1] = ((c[1] >> 2) & 0x0f) | ((c[2] & 0x0f) << 4)
+//   dst[2] = ((c[2] >> 4) & 0x03) | ((c[3] & 0x3f) << 2)
+static inline void rocmfpx_fp6_pack4(uint8_t * dst, const uint8_t * c) {
+    dst[0] = (uint8_t)( (c[0] & 0x3fu)        | ((c[1] & 0x03u) << 6) );
+    dst[1] = (uint8_t)( ((c[1] >> 2) & 0x0fu) | ((c[2] & 0x0fu) << 4) );
+    dst[2] = (uint8_t)( ((c[2] >> 4) & 0x03u) | ((c[3] & 0x3fu) << 2) );
+}
+
+static int rocmfpx_decode_fp6_code(uint8_t code) {
+    const int mag = code & 31u;
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
+    if (!isfinite(x) || !isfinite(inv_scale) || inv_scale <= 0.0f) {
+        return 0;
+    }
+    int q = (int) lroundf(x * inv_scale);
+    if (q > 31) { q = 31; }
+    else if (q < -32) { q = -32; }
+    return q == 0 ? 0 : (uint8_t) (q < 0 ? (32u | ((uint8_t) -q & 31u)) : (uint8_t) q);
+}
+
+static inline float rocmfpx_fp6_decoded_value(float x, float inv_scale) {
+    int q = (int) lroundf(x * inv_scale);
+    if (q > 31) { q = 31; }
+    else if (q < -32) { q = -32; }
+    return (float) q;
+}
+
+static float rocmfpx_fp6_block_mse_for_scale(const float * x, int n, uint8_t e, float best_err) {
+    const float scale = rocmfpx_scale_lookup(e);
+    const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float err = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) { continue; }
+        const float y = rocmfpx_fp6_decoded_value(x[i], inv_scale) * scale;
+        const float d = x[i] - y;
+        err += d * d;
+        if (err > best_err) { return err; }
+    }
+    return err;
+}
+
+static uint8_t rocmfpx_choose_scale_fp6_mse(const float * x, int n) {
+    float max_abs = rocmfpx_max_abs(x, n);
+    if (!(max_abs > 0.0f) || !isfinite(max_abs)) {
+        return 0;
+    }
+
+    const uint8_t start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 32.0f);
+    uint8_t best_e = start_e;
+    float best_err = INFINITY;
+    bool lower_done = false;
+
+    for (int delta = 0; delta <= 125; ++delta) {
+        const int e0 = (int) start_e - delta;
+        if (!lower_done && e0 >= 1 && e0 <= 126) {
+            const float scale = rocmfpx_scale_lookup((uint8_t) e0);
+            const float clip_delta = max_abs - 32.0f * scale;
+            const float clip_err = clip_delta * clip_delta;
+            if (clip_delta > 0.0f && clip_err > best_err) {
+                lower_done = true;
+            } else {
+                const float err = rocmfpx_fp6_block_mse_for_scale(x, n, (uint8_t) e0, best_err);
+                if (err < best_err || (err == best_err && e0 < best_e)) {
+                    best_err = err;
+                    best_e = (uint8_t) e0;
+                }
+            }
+        }
+
+        const int e1 = (int) start_e + delta;
+        if (delta != 0 && e1 >= 1 && e1 <= 126) {
+            const float err = rocmfpx_fp6_block_mse_for_scale(x, n, (uint8_t) e1, best_err);
+            if (err < best_err || (err == best_err && e1 < best_e)) {
+                best_err = err;
+                best_e = (uint8_t) e1;
+            }
+        }
+
+        if ((lower_done || e0 <= 1) && e1 >= 126) {
+            break;
+        }
+    }
+    return best_e;
+}
+
+void rocmfpx_quantize_row_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP6 == 0);
+    const int64_t nb = k / QK_ROCMFP6;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_ROCMFP6;
+        block_rocmfp6 * yb = y + ib;
+
+        for (int half = 0; half < 2; ++half) {
+            const int half_off = half * (QK_ROCMFP6 / 2);
+            const float * xh = xb + half_off;
+            yb->e[half] = rocmfpx_choose_scale_fp6_mse(xh, QK_ROCMFP6 / 2);
+
+            const float scale = rocmfpx_scale_lookup(yb->e[half]);
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+            uint8_t codes[QK_ROCMFP6 / 2];
+            for (int j = 0; j < QK_ROCMFP6 / 2; ++j) {
+                codes[j] = rocmfpx_quantize_fp6_code(xh[j], inv_scale);
+            }
+            uint8_t * qsdst = yb->qs + half_off * 6 / 8;
+            rocmfpx_fp6_pack4(qsdst,       codes);
+            rocmfpx_fp6_pack4(qsdst +  3,  codes +  4);
+            rocmfpx_fp6_pack4(qsdst +  6,  codes +  8);
+            rocmfpx_fp6_pack4(qsdst +  9,  codes + 12);
+        }
+    }
+}
+
+void rocmfpx_dequantize_row_fp6(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP6 == 0);
+    const int64_t nb = k / QK_ROCMFP6;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_rocmfp6 * xb = x + ib;
+        float * yb = y + ib * QK_ROCMFP6;
+
+        uint8_t codes[QK_ROCMFP6];
+        // Unpack 8 groups of 4 from 24 bytes (8 × 3 bytes)
+        {
+            const uint8_t * s = xb->qs;
+            codes[0]  =  s[0]       & 0x3fu;
+            codes[1]  = ((s[0] >> 6) & 0x03u) | ((s[1] & 0x0fu) << 2);
+            codes[2]  = ((s[1] >> 4) & 0x0fu) | ((s[2] & 0x03u) << 4);
+            codes[3]  =  (s[2] >> 2) & 0x3fu;
+
+            codes[4]  =  s[3]       & 0x3fu;
+            codes[5]  = ((s[3] >> 6) & 0x03u) | ((s[4] & 0x0fu) << 2);
+            codes[6]  = ((s[4] >> 4) & 0x0fu) | ((s[5] & 0x03u) << 4);
+            codes[7]  =  (s[5] >> 2) & 0x3fu;
+
+            codes[8]  =  s[6]       & 0x3fu;
+            codes[9]  = ((s[6] >> 6) & 0x03u) | ((s[7] & 0x0fu) << 2);
+            codes[10] = ((s[7] >> 4) & 0x0fu) | ((s[8] & 0x03u) << 4);
+            codes[11] =  (s[8] >> 2) & 0x3fu;
+
+            codes[12] =  s[9]       & 0x3fu;
+            codes[13] = ((s[9] >> 6) & 0x03u) | ((s[10] & 0x0fu) << 2);
+            codes[14] = ((s[10] >> 4) & 0x0fu) | ((s[11] & 0x03u) << 4);
+            codes[15] =  (s[11] >> 2) & 0x3fu;
+
+            codes[16] =  s[12]      & 0x3fu;
+            codes[17] = ((s[12] >> 6) & 0x03u) | ((s[13] & 0x0fu) << 2);
+            codes[18] = ((s[13] >> 4) & 0x0fu) | ((s[14] & 0x03u) << 4);
+            codes[19] =  (s[14] >> 2) & 0x3fu;
+
+            codes[20] =  s[15]      & 0x3fu;
+            codes[21] = ((s[15] >> 6) & 0x03u) | ((s[16] & 0x0fu) << 2);
+            codes[22] = ((s[16] >> 4) & 0x0fu) | ((s[17] & 0x03u) << 4);
+            codes[23] =  (s[17] >> 2) & 0x3fu;
+
+            codes[24] =  s[18]      & 0x3fu;
+            codes[25] = ((s[18] >> 6) & 0x03u) | ((s[19] & 0x0fu) << 2);
+            codes[26] = ((s[19] >> 4) & 0x0fu) | ((s[20] & 0x03u) << 4);
+            codes[27] =  (s[20] >> 2) & 0x3fu;
+
+            codes[28] =  s[21]      & 0x3fu;
+            codes[29] = ((s[21] >> 6) & 0x03u) | ((s[22] & 0x0fu) << 2);
+            codes[30] = ((s[22] >> 4) & 0x0fu) | ((s[23] & 0x03u) << 4);
+            codes[31] =  (s[23] >> 2) & 0x3fu;
+        }
+
+        for (int half = 0; half < 2; ++half) {
+            const float scale = rocmfpx_scale_lookup(xb->e[half]);
+            for (int j = 0; j < QK_ROCMFP6 / 2; ++j) {
+                const int i = half * (QK_ROCMFP6 / 2) + j;
+                yb[i] = (float) rocmfpx_decode_fp6_code(codes[i]) * scale;
+            }
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp6_ref(x, (block_rocmfp6 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp6(n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_fp6_ref(src + row * n_per_row, (block_rocmfp6 *) qrow, n_per_row);
+        qrow += row_size;
+    }
+    return (size_t) nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// FP8 helpers
+// ---------------------------------------------------------------------------
+
+static int8_t rocmfpx_quantize_fp8_code(float x, float inv_scale) {
+    if (!isfinite(x) || inv_scale <= 0.0f) {
+        return 0;
+    }
+    int q = (int) lroundf(x * inv_scale);
+    if (q > 127) { q = 127; }
+    else if (q < -127) { q = -127; }
+    return (int8_t) q;
+}
+
+void rocmfpx_quantize_row_fp8_ref(const float * GGML_RESTRICT x, block_rocmfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP8 == 0);
+    const int64_t nb = k / QK_ROCMFP8;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_ROCMFP8;
+        block_rocmfp8 * yb = y + ib;
+
+        const float max_abs = rocmfpx_max_abs(xb, QK_ROCMFP8);
+        yb->e = rocmfpx_nearest_scale_ue4m3(max_abs / 127.0f);
+
+        const float scale = rocmfpx_scale_lookup(yb->e);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        for (int i = 0; i < QK_ROCMFP8; ++i) {
+            yb->qs[i] = rocmfpx_quantize_fp8_code(xb[i], inv_scale);
+        }
+    }
+}
+
+void rocmfpx_dequantize_row_fp8(const block_rocmfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP8 == 0);
+    const int64_t nb = k / QK_ROCMFP8;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_rocmfp8 * xb = x + ib;
+        float * yb = y + ib * QK_ROCMFP8;
+
+        const float scale = rocmfpx_scale_lookup(xb->e);
+        for (int i = 0; i < QK_ROCMFP8; ++i) {
+            yb[i] = (float) xb->qs[i] * scale;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp8_ref(x, (block_rocmfp8 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp8(n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_fp8_ref(src + row * n_per_row, (block_rocmfp8 *) qrow, n_per_row);
+        qrow += row_size;
+    }
+    return (size_t) nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// Row size helpers
+// ---------------------------------------------------------------------------
+
+size_t rocmfpx_row_size_fp6(int64_t k) {
+    assert(k % QK_ROCMFP6 == 0);
+    return (size_t) (k / QK_ROCMFP6) * sizeof(block_rocmfp6);
+}
+
+size_t rocmfpx_row_size_fp8(int64_t k) {
+    assert(k % QK_ROCMFP8 == 0);
+    return (size_t) (k / QK_ROCMFP8) * sizeof(block_rocmfp8);
+}
