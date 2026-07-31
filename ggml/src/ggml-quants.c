@@ -2,6 +2,8 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "../rocmfpx/rocmfpx.h"
+#include "../rocmfp4/rocmfp4.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -609,6 +611,22 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+}
+
+void quantize_row_rocmfpx_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp6_ref(x, y, k);
+}
+
+void dequantize_row_rocmfpx_fp6(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp6(x, y, k);
+}
+
+void quantize_row_rocmfpx_fp8_ref(const float * GGML_RESTRICT x, block_rocmfp8 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp8_ref(x, y, k);
+}
+
+void dequantize_row_rocmfpx_fp8(const block_rocmfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp8(x, y, k);
 }
 
 //
@@ -2309,6 +2327,18 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_rocmfpx_fp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    rocmfpx_quantize_fp6(src, dst, nrow, n_per_row, quant_weights);
+    return nrow * ggml_row_size(GGML_TYPE_Q6_0_ROCMFPX, n_per_row);
+}
+
+size_t quantize_rocmfpx_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    rocmfpx_quantize_fp8(src, dst, nrow, n_per_row, quant_weights);
+    return nrow * ggml_row_size(GGML_TYPE_Q8_0_ROCMFPX, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5564,6 +5594,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_NVFP4:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q6_0_ROCMFPX:
+            {
+                // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            {
+                // UE4M3 scale is uint8_t — all byte values are valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
             } break;

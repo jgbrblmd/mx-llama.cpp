@@ -21,6 +21,8 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfpx/rocmfpx.h"
+#include "../../rocmfp4/rocmfp4.h"
 
 #include <array>
 #include <algorithm>
@@ -848,6 +850,24 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+// ROCmFP6 device layout. GGUF/CPU storage remains the packed block_rocmfp6 layout.
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
+
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
@@ -1036,6 +1056,34 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP6;
+    static constexpr int qr = QR_ROCMFP6;
+    static constexpr int qi = QI_ROCMFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP8;
+    static constexpr int qr = QR_ROCMFP8;
+    static constexpr int qi = QI_ROCMFP8;
 };
 
 template<>

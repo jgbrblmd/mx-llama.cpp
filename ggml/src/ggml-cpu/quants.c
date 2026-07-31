@@ -62,6 +62,14 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_rocmfp4_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_quantize_row_q4_0_ref(x, (block_rocmfp4 *) y, k);
+}
+
+void quantize_row_rocmfp4_q4_0_fast(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_quantize_row_q4_0_fast_ref(x, (block_rocmfp4_fast *) y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -359,6 +367,152 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             sumf += dy * d * (sumi_lo + sumi_hi);
         }
     }
+    *s = sumf;
+}
+
+// ROCmFP4: 32 weights / block, 16 bytes packed codes + 2 UE4M3 scale bytes
+void ggml_vec_dot_rocmfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP4 == 0);
+    static_assert(QK_ROCMFP4 == QK8_0, "QK_ROCMFP4 and QK8_0 must be the same");
+
+    const block_rocmfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP4;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = rocmfp4_ue4m3_to_fp32_half(x[ib].e[0]) * ggml_fp16_to_fp32(y[ib].d);
+        const float d1 = rocmfp4_ue4m3_to_fp32_half(x[ib].e[1]) * ggml_fp16_to_fp32(y[ib].d);
+        int sumi0 = 0;
+        int sumi1 = 0;
+
+        for (int j = 0; j < QK_ROCMFP4/2; ++j) {
+            const uint8_t q = x[ib].qs[j];
+            sumi0 += rocmfp4_decode_table(q)      * y[ib].qs[j];
+            sumi1 += rocmfp4_decode_table(q >> 4) * y[ib].qs[j + QK_ROCMFP4/2];
+        }
+
+        sumf += d0 * (float) sumi0 + d1 * (float) sumi1;
+    }
+
+    *s = sumf;
+}
+
+// ROCmFP4 fast: 32 weights / block, 16 bytes packed codes + 1 UE4M3 scale byte
+void ggml_vec_dot_rocmfp4_fast_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP4 == 0);
+    static_assert(QK_ROCMFP4 == QK8_0, "QK_ROCMFP4 and QK8_0 must be the same");
+
+    const block_rocmfp4_fast * GGML_RESTRICT x = vx;
+    const block_q8_0         * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP4;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = rocmfp4_ue4m3_to_fp32_half(x[ib].e) * ggml_fp16_to_fp32(y[ib].d);
+        int sumi = 0;
+
+        for (int j = 0; j < QK_ROCMFP4/2; ++j) {
+            const uint8_t q = x[ib].qs[j];
+            sumi += rocmfp4_decode_table(q)      * y[ib].qs[j];
+            sumi += rocmfp4_decode_table(q >> 4) * y[ib].qs[j + QK_ROCMFP4/2];
+        }
+
+        sumf += d * (float) sumi;
+    }
+
+    *s = sumf;
+}
+
+// ROCmFP6: 32 weights / block, 24 bytes packed 6-bit codes + 2 UE4M3 scale bytes
+static inline uint32_t ggml_rocmfpx_get_bits_cpu(const uint8_t * src, int bit_pos, int nbits) {
+    const int byte_pos = bit_pos >> 3;
+    const int shift    = bit_pos & 7;
+    uint32_t v = src[byte_pos];
+    v |= (uint32_t) src[byte_pos + 1] << 8;
+    v |= (uint32_t) src[byte_pos + 2] << 16;
+    return (v >> shift) & ((1u << nbits) - 1u);
+}
+
+static inline int ggml_rocmfpx_decode_fp6_cpu(uint32_t code) {
+    const int mag = (int) (code & 31u);
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+void ggml_vec_dot_rocmfpx_fp6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP6 == 0);
+    static_assert(QK_ROCMFP6 == QK8_0, "QK_ROCMFP6 and QK8_0 must be the same");
+
+    const block_rocmfp6 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP6;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = ggml_fp16_to_fp32(y[ib].d);
+        int sumi0 = 0;
+        int sumi1 = 0;
+        for (int j = 0; j < QK_ROCMFP6/2; ++j) {
+            const int q0 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, j*6, 6));
+            const int q1 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, (j + QK_ROCMFP6/2)*6, 6));
+            sumi0 += q0 * (int) y[ib].qs[j];
+            sumi1 += q1 * (int) y[ib].qs[j + QK_ROCMFP6/2];
+        }
+        sumf += dy * (
+            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
+            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
+    }
+
+    *s = sumf;
+}
+
+// ROCmFP8: 32 weights / block, 32 bytes int8 codes + 1 UE4M3 scale byte
+void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP8 == 0);
+    static_assert(QK_ROCMFP8 == QK8_0, "QK_ROCMFP8 and QK8_0 must be the same");
+
+    const block_rocmfp8 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP8;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = rocmfpx_ue4m3_to_fp32(x[ib].e);
+        const float dy = ggml_fp16_to_fp32(y[ib].d);
+        const float d  = dx * dy;
+        int sumi = 0;
+        for (int j = 0; j < QK_ROCMFP8; ++j) {
+            sumi += (int) x[ib].qs[j] * (int) y[ib].qs[j];
+        }
+        sumf += d * (float) sumi;
+    }
+
     *s = sumf;
 }
 
