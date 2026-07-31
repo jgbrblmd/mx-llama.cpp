@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "rocmfp4_hip_codebook.cuh"
 
 #include <cstdint>
 
@@ -304,6 +305,32 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
     return d8_1*sumf;
 }
 
+// ROCmFP6 MMQ dp4a impl: FP6 blocks carry two half-block scales (e[0] covers
+// elements 0..15, e[1] covers 16..31), i.e. one scale per QI_ROCMFP6/2 packed
+// ints (16 values). This differs from the q8_0_16 layout (one scale per 16
+// ints) and from q8_0 (one per block), so it needs its own impl. With
+// vdr = QI_ROCMFP6 = 8 packed ints this processes 1 FP6 block == 2 scales.
+template <int vdr> static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1_mmq_impl(
+    const int * v, const int * u, const float * d8_0, const float & d8_1) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i0 = 0; i0 < vdr; i0 += QI_ROCMFP6/2) {
+        int sumi = 0;
+
+#pragma unroll
+        for (int i = i0; i < i0 + QI_ROCMFP6/2; ++i) {
+            // SIMD dot product of quantized values
+            sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+        }
+
+        sumf += d8_0[i0/(QI_ROCMFP6/2)]*sumi;
+    }
+
+    return d8_1*sumf;
+}
+
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
@@ -360,6 +387,173 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+#ifndef GGML_ROCMFP4_Q8_1_MMQ_VDR
+#define GGML_ROCMFP4_Q8_1_MMQ_VDR 8
+#endif
+#ifndef GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
+#define GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR GGML_ROCMFP4_Q8_1_MMQ_VDR
+#endif
+// MMVQ: one aux_q4 int holds 8 nibbles, so 4 ints cover a 32-value block
+// (v.x = first 16 values, v.y = second 16 values). VDR=8 would read past the
+// 4-int qs array and divide by zero in the MMVQ kernel (qi/vdr = 4/8 = 0).
+#define VDR_ROCMFP4_Q8_1_MMVQ 4
+#define VDR_ROCMFP4_Q8_1_MMQ  GGML_ROCMFP4_Q8_1_MMQ_VDR
+#define VDR_ROCMFP4_FAST_Q8_1_MMVQ 4
+#define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
+
+static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp4 * bq4 = (const block_rocmfp4 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_ROCMFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+
+        sumi0 = ggml_cuda_dp4a(v.x, q8[l + 0], sumi0);
+        sumi1 = ggml_cuda_dp4a(v.y, q8[l + 4], sumi1);
+    }
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (rocmfp4_ue4m3_to_fp32_half_finite(bq4->e[0]) * sumi0 + rocmfp4_ue4m3_to_fp32_half_finite(bq4->e[1]) * sumi1);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfp4_fast_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp4_fast * bq4 = (const block_rocmfp4_fast *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_ROCMFP4_FAST_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    return __low2float(bq8_1->ds) * rocmfp4_ue4m3_to_fp32_half_finite(bq4->e) * sumi;
+}
+
+#define VDR_ROCMFP6_Q8_1_MMVQ 8
+#define VDR_ROCMFP6_Q8_1_MMQ  4
+#define VDR_ROCMFP8_Q8_1_MMVQ 2
+#define VDR_ROCMFP8_Q8_1_MMQ  8
+
+static __device__ __forceinline__ int rocmfpx_decode_fp6_code_vec_cuda(const uint32_t code) {
+    const int mag = (int) (code & 31u);
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+static __device__ __forceinline__ int rocmfpx_pack4_fp6_bits24_vec_cuda(const uint32_t bits24) {
+    const char4 v = make_char4(
+        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(bits24 & 63u),
+        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >>  6) & 63u),
+        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >> 12) & 63u),
+        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >> 18) & 63u));
+    return *((const int *) &v);
+}
+
+static __device__ __forceinline__ int rocmfpx_pack4_fp6_device_vec_cuda(
+    const block_rocmfp6_device * bq6, const int base) {
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+    const char4 v = make_char4(bq6->qs[base + 0], bq6->qs[base + 1], bq6->qs[base + 2], bq6->qs[base + 3]);
+    return *((const int *) &v);
+#else
+    uint32_t qs0, qs1, qs2, qs3, qs4, qs5;
+    memcpy(&qs0, bq6->qs +  0, 4);
+    memcpy(&qs1, bq6->qs +  4, 4);
+    memcpy(&qs2, bq6->qs +  8, 4);
+    memcpy(&qs3, bq6->qs + 12, 4);
+    memcpy(&qs4, bq6->qs + 16, 4);
+    memcpy(&qs5, bq6->qs + 20, 4);
+    const uint32_t qs[6] = { qs0, qs1, qs2, qs3, qs4, qs5 };
+
+    const int start_bit = 6 * base;
+    const int reg_idx = start_bit >> 5;
+    const int reg_shift = start_bit & 31;
+    const uint32_t val_low  = qs[reg_idx];
+    const uint32_t val_high = qs[reg_idx + 1];
+    const uint32_t bits24 = (reg_shift == 0) ? (val_low & 0xFFFFFFu) :
+        (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFFFFu);
+
+    return rocmfpx_pack4_fp6_bits24_vec_cuda(bits24);
+#endif
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp6_device * bq6 = (const block_rocmfp6_device *) vbq + kbx;
+
+#if !GGML_ROCMFP6_EXPANDED_DEVICE
+    uint32_t qs0, qs1, qs2, qs3, qs4, qs5;
+    memcpy(&qs0, bq6->qs +  0, 4);
+    memcpy(&qs1, bq6->qs +  4, 4);
+    memcpy(&qs2, bq6->qs +  8, 4);
+    memcpy(&qs3, bq6->qs + 12, 4);
+    memcpy(&qs4, bq6->qs + 16, 4);
+    memcpy(&qs5, bq6->qs + 20, 4);
+    const uint32_t qs[6] = { qs0, qs1, qs2, qs3, qs4, qs5 };
+#endif
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP6_Q8_1_MMVQ; ++i) {
+        const int base = 4 * (iqs + i);
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+        const int val_packed = rocmfpx_pack4_fp6_device_vec_cuda(bq6, base);
+#else
+        const int start_bit = 6 * base;
+        const int reg_idx = start_bit >> 5;
+        const int reg_shift = start_bit & 31;
+        const uint32_t val_low  = qs[reg_idx];
+        const uint32_t val_high = qs[reg_idx + 1];
+        const uint32_t bits24 = (reg_shift == 0) ? (val_low & 0xFFFFFFu) :
+            (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFFFFu);
+        const int val_packed = rocmfpx_pack4_fp6_bits24_vec_cuda(bits24);
+#endif
+        const int u = get_int_b4(bq8_1->qs, iqs + i);
+        if (base < QK_ROCMFP6/2) {
+            sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(val_packed, u, sumi1);
+        }
+    }
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (ggml_cuda_ue4m3_to_fp32(bq6->e[0]) * sumi0 + ggml_cuda_ue4m3_to_fp32(bq6->e[1]) * sumi1);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp8 * bq8 = (const block_rocmfp8 *) vbq + kbx;
+
+    int v[VDR_ROCMFP8_Q8_1_MMVQ];
+    int u[VDR_ROCMFP8_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP8_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b1(bq8->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+
+    return vec_dot_q8_0_q8_1_impl<float, VDR_ROCMFP8_Q8_1_MMVQ>(
+        v, u, ggml_cuda_ue4m3_to_fp32(bq8->e), __low2half(bq8_1->ds));
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 

@@ -156,6 +156,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103, // ROCmFP4 single-scale speed layout
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX  = 110, // ROCmFPx experimental 6-bit reference layout
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX  = 111, // ROCmFPx experimental 8-bit reference layout
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
