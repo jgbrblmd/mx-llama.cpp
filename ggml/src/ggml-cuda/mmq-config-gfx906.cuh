@@ -24,5 +24,25 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
         return ggml_cuda_mmq_config(
             rdna2.type, 512, rdna2.occupancy, rdna2.I, rdna2.J, rdna2.sram_layout, rdna2.K_vram, rdna2.stream_k, rdna2.fallback);
     }
+    // FP8: same layout as Q8_0 (int8 data, Q8_1 layout)
+    if (type == GGML_TYPE_Q8_0_ROCMFPX && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q8_0_ROCMFPX, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
+    // FP6: 16-wide dp4a path, same I/nthreads as Q8_0 on gfx906
+    if (type == GGML_TYPE_Q6_0_ROCMFPX && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q6_0_ROCMFPX, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
+    // ROCmFP4 standard: 16-wide dp4a path, same nthreads as Q8_0 on gfx906
+    if (type == GGML_TYPE_Q4_0_ROCMFP4 && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q4_0_ROCMFP4, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
+    // ROCmFP4 fast: same as Q8_0 (single scale, int8-like dp4a)
+    if (type == GGML_TYPE_Q4_0_ROCMFP4_FAST && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q4_0_ROCMFP4_FAST, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 }
