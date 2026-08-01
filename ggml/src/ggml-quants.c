@@ -5597,6 +5597,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
             } break;
+        case GGML_TYPE_Q4_0_ROCMFP4:
+            {
+                // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            {
+                // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
         case GGML_TYPE_Q6_0_ROCMFPX:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
