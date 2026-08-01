@@ -5380,10 +5380,14 @@ class GGMLQuantizationType(IntEnum):
     BF16    = 30
     TQ1_0   = 34
     TQ2_0   = 35
-    MXFP4   = 39
-    NVFP4   = 40
-    Q1_0    = 41
-    Q2_0    = 42
+    NVFP4   = 39
+    Q1_0    = 40
+    Q2_0    = 41
+    MXFP4   = 42
+    Q4_0_ROCMFP4      = 100  # ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+    Q4_0_ROCMFP4_FAST = 101  # ROCmFP4 single-scale speed layout
+    Q6_0_ROCMFPX      = 102  # ROCmFPx experimental 6-bit UE4M3-scale reference layout
+    Q8_0_ROCMFPX      = 103  # ROCmFPx experimental 8-bit UE4M3-scale reference layout
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5440,6 +5444,11 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_MXFP4         = 42  # except 1d tensors
+    MOSTLY_Q4_0_ROCMFP4      = 100  # ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+    MOSTLY_Q4_0_ROCMFP4_FAST = 103  # ROCmFP4 single-scale speed layout
+    MOSTLY_Q6_0_ROCMFPX      = 110  # ROCmFPx experimental 6-bit reference layout
+    MOSTLY_Q8_0_ROCMFPX      = 111  # ROCmFPx experimental 8-bit reference layout
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5576,6 +5585,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 16 + 2),
+    GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 16 + 1),
+    GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
+    GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
 }
 
 
