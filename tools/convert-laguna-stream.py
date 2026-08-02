@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Streaming safetensors -> NVFP4 GGUF for Laguna-S-2.1.
+Streaming safetensors -> ROCmFP4 GGUF for Laguna-S-2.1.
 
-No BF16 intermediate file: every tensor is transposed, quantized to NVFP4
-(torch, bit-identical semantics to ggml-quants.c quantize_row_nvfp4_ref) and
-written to the GGUF data section immediately. Memory stays O(one tensor).
+No BF16 intermediate file: every tensor is transposed, quantized to ROCmFP4
+(the fork's AMD-tuned 4-bit format, 18 bytes / 32 values, exhaustive UE4M3
+scale search) and written to the GGUF data section immediately. Quantization
+calls the C reference (rocmfp4_quantize_row_q4_0_ref via ctypes) so the output
+matches llama-quantize byte for byte. Memory stays O(one tensor).
 
 Layout ground truth: /opt/LLM/hf/jcbtc/Laguna-S-2.1-NVFP4.gguf (ModelOpt build)
 minus its e8m0-specific scale/input_scale tensors == 814 tensors. The ModelOpt
-file runs on this fork (shapes verified) but its scales are e8m0 (NVIDIA
-packing) while this fork's GGML_TYPE_NVFP4 (36 bytes / 64 values) uses e4m3
-scales, hence the re-quantization from BF16 safetensors.
+file's e8m0 scale packing is incompatible with llama.cpp, hence the
+re-quantization from BF16 safetensors (ROCmFP4 beats NVFP4 on gfx906 in both
+precision and speed; NVFP4 is kept only for file compatibility).
 
-Tensors that must NOT be quantized (row length not a multiple of the 64-value
-NVFP4 block, or 1D convention):
+Tensors that must NOT be quantized (row length not a multiple of the 32-value
+ROCmFP4 block, or 1D convention):
   - all 1D norms / biases / q_norm / k_norm / exp_probs_b  -> F32 (as in reference)
-  - attn_gate (48/72 heads -> rows of 48/72, ggml_row_size asserts 64-alignment) -> F32
+  - attn_gate (48/72 heads -> rows of 48/72, ggml_row_size asserts 32-alignment) -> F32
   - ffn_gate_inp (router, reference keeps F32 to protect top-k selection) -> F32
 
 Usage: python convert-laguna-stream.py <src-gguf> <src-dir> <out-gguf>
@@ -41,7 +43,7 @@ N_HEADS_FULL, N_HEADS_SWA = 48, 72
 def layer_heads(il):
     return N_HEADS_FULL if il % SWA_PERIOD == 0 else N_HEADS_SWA
 
-from nvfp4_quant import quantize_nvfp4
+from rocmfp4_quant import quantize_rocmfp4
 
 # ---------------- metadata copy ----------------
 w = GGUFWriter(OUT, 'laguna')
@@ -144,10 +146,10 @@ for name in order:
     if tensor_is_f32(name, shape):
         w.add_tensor_info(name, shape, np.float32, n * 4)
     else:
-        assert shape[-1] % 64 == 0, f'{name}: row {shape[-1]} not NVFP4-block aligned'
-        byte_shape = shape[:-1] + [shape[-1] * 36 // 64]
-        w.add_tensor_info(name, byte_shape, np.uint8, n * 36 // 64,
-                          raw_dtype=GGMLQuantizationType.NVFP4)
+        assert shape[-1] % 32 == 0, f'{name}: row {shape[-1]} not ROCmFP4-block aligned'
+        byte_shape = shape[:-1] + [shape[-1] * 18 // 32]
+        w.add_tensor_info(name, byte_shape, np.uint8, n * 18 // 32,
+                          raw_dtype=GGMLQuantizationType.Q4_0_ROCMFP4)
 
 w.write_header_to_file()
 w.write_kv_data_to_file()
@@ -176,7 +178,7 @@ for name in order:
             parts.append(open_shards[s].get_slice(k)[:])
         t = torch.stack(parts, dim=0)  # [256, out, in]
         del parts
-        q = quantize_nvfp4(t.contiguous().to(torch.float32))
+        q = quantize_rocmfp4(t.contiguous().to(torch.float32))
         del t
     elif tensor_is_f32(name, shape):
         t = open_shards[shard].get_slice(key)[:]
@@ -190,7 +192,7 @@ for name in order:
         if tuple(t.shape) != tuple(shape):
             t = t.T
         assert t.shape == tuple(shape), f'{name}: {t.shape} vs {shape}'
-        q = quantize_nvfp4(t.contiguous().to(torch.float32))
+        q = quantize_rocmfp4(t.contiguous().to(torch.float32))
         del t
     w.write_tensor_data(q.cpu().numpy())
     del q
