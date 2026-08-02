@@ -497,6 +497,28 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// NVFP4 with log2-fixed-point scales (ModelOpt GGUF export):
+//   scale = 2^((e - 169) / 8), one byte per 16-element sub-block
+// paired with kvalues_mxfp4 (2x E2M1), so value = kvalues_mxfp4[idx] * scale
+static inline float ggml_nvfp4_e8m0_to_fp32(uint8_t x) {
+    return exp2f(((float) x - 169.0f) * 0.125f);
+}
+
+static inline uint8_t ggml_fp32_to_nvfp4_e8m0(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    float e = 8.0f*log2f(x) + 169.0f;
+    int ei = (int) (e + 0.5f); // round to nearest
+    if (ei < 1) {
+        ei = 1;
+    }
+    if (ei > 254) {
+        ei = 254;
+    }
+    return (uint8_t) ei;
+}
+
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {

@@ -153,6 +153,7 @@ std::unique_ptr<llm_graph_context> llama_model_laguna::build_arch_graph(const ll
 
 llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     ggml_tensor * cur;
@@ -287,7 +288,22 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    /* probs_in */ nullptr,
+                    /* gate_up_exps */ nullptr,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s,
+                    /* selected_experts_in */ nullptr);
+            // ModelOpt NVFP4 export (recognized by the per-expert scale tensors
+            // passed into build_moe_ffn) normalizes expert weights by a global
+            // constant (C ~ 9300, fitted vs the BF16 source with spread <0.5%);
+            // laguna has no post-ffn norm so the factor must be applied
+            // explicitly. Self-quantized NVFP4 GGUFs carry no scale tensors and
+            // must NOT be rescaled.
+            if (model.layers[il].ffn_up_exps_s != nullptr) {
+                moe_out = ggml_scale(ctx0, moe_out, 9300.0f);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // Always-on shared expert, summed in parallel.
