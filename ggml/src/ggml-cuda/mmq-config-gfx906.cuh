@@ -24,6 +24,17 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
         return ggml_cuda_mmq_config(
             rdna2.type, 512, rdna2.occupancy, rdna2.I, rdna2.J, rdna2.sram_layout, rdna2.K_vram, rdna2.stream_k, rdna2.fallback);
     }
+    // NVFP4: 8 warps as well. rdna2 caps its NVFP4 table at J=64; extend to
+    // J=128 like Q8_0 - the occupancy gate in mul_mat_q_switch_J (mmq.cuh)
+    // keeps wide tiles for shapes that fill the CUs, so results stay identical.
+    if (type == GGML_TYPE_NVFP4 && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_NVFP4, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, fallback);
+    }
+    if (type == GGML_TYPE_NVFP4_E8M0 && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_NVFP4_E8M0, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, fallback);
+    }
     // FP8: same layout as Q8_0 (int8 data, Q8_1 layout)
     if (type == GGML_TYPE_Q8_0_ROCMFPX && J >= 8 && J <= 128 && (J % 8) == 0) {
         return ggml_cuda_mmq_config(
