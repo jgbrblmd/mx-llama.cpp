@@ -569,6 +569,25 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+        // NVIDIA ModelOpt NVFP4 GGUF export: expert weights use log2-fixed-point
+        // scales (GGML_TYPE_NVFP4_E8M0) instead of the UE4M3 encoding, marked by
+        // extra bookkeeping tensors blk.*.ffn_*_exps.scale / .input_scale
+        bool is_modelopt_nvfp4 = false;
+        if (arch_name == "laguna") {
+            for (int i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+                const char * tn = gguf_get_tensor_name(metadata, i);
+                if (strstr(tn, ".ffn_gate_exps.scale") != nullptr ||
+                    strstr(tn, ".ffn_up_exps.scale")   != nullptr ||
+                    strstr(tn, ".ffn_down_exps.scale") != nullptr) {
+                    is_modelopt_nvfp4 = true;
+                    break;
+                }
+            }
+            if (is_modelopt_nvfp4) {
+                LLAMA_LOG_INFO("%s: detected ModelOpt NVFP4 export, remapping expert tensors to NVFP4_E8M0\n", __func__);
+            }
+        }
+
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
 
@@ -577,6 +596,9 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            if (is_modelopt_nvfp4 && cur->type == GGML_TYPE_NVFP4) {
+                cur->type = GGML_TYPE_NVFP4_E8M0;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -649,6 +671,9 @@ llama_model_loader::llama_model_loader(
                     }
                     n_elements += ggml_nelements(cur);
                     n_bytes    += ggml_nbytes(cur);
+                    if (is_modelopt_nvfp4 && cur->type == GGML_TYPE_NVFP4) {
+                        cur->type = GGML_TYPE_NVFP4_E8M0;
+                    }
                     weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
                 }
             }
@@ -763,6 +788,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_NVFP4_E8M0: ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             case GGML_TYPE_Q4_0_ROCMFP4:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4;    break;

@@ -226,6 +226,12 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// NVFP4 with log2-fixed-point scales, as packed by NVIDIA ModelOpt GGUF export:
+//   scale = 2^((e - 169) / 8)   (one byte per 16-element sub-block)
+// same block layout and value table as NVFP4, only the scale decode differs
+typedef block_nvfp4 block_nvfp4_e8m0;
+#define QK_NVFP4_E8M0 QK_NVFP4
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
