@@ -5380,10 +5380,13 @@ class GGMLQuantizationType(IntEnum):
     BF16    = 30
     TQ1_0   = 34
     TQ2_0   = 35
-    NVFP4   = 39
-    Q1_0    = 40
-    Q2_0    = 41
-    MXFP4   = 42
+    # NOTE: on-disk ids must match the fork's C enum (ggml/include/ggml.h):
+    # MXFP4=39, NVFP4=40, Q1_0=41, Q2_0=42 (fork renumbered vs upstream by +1)
+    MXFP4   = 39
+    NVFP4   = 40
+    Q1_0    = 41
+    Q2_0    = 42
+    NVFP4_E8M0 = 43  # NVFP4 with log2-fixed-point scales (NVIDIA ModelOpt GGUF export)
     Q4_0_ROCMFP4      = 100  # ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
     Q4_0_ROCMFP4_FAST = 101  # ROCmFP4 single-scale speed layout
     Q6_0_ROCMFPX      = 102  # ROCmFPx experimental 6-bit UE4M3-scale reference layout
@@ -5583,6 +5586,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+    GGMLQuantizationType.NVFP4_E8M0: (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 16 + 2),
