@@ -4784,6 +4784,7 @@ class GGMLQuantizationType(IntEnum):
     Q4_0_ROCMFP4_FAST = 101  # ROCmFP4 single-scale speed layout
     Q6_0_ROCMFPX      = 102  # ROCmFPx experimental 6-bit UE4M3-scale reference layout
     Q8_0_ROCMFPX      = 103  # ROCmFPx experimental 8-bit UE4M3-scale reference layout
+    Q2_0_ROCMFPX      = 107  # ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4845,6 +4846,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q4_0_ROCMFP4_FAST = 103  # ROCmFP4 single-scale speed layout
     MOSTLY_Q6_0_ROCMFPX      = 110  # ROCmFPx experimental 6-bit reference layout
     MOSTLY_Q8_0_ROCMFPX      = 111  # ROCmFPx experimental 8-bit reference layout
+    MOSTLY_Q2_0_ROCMFPX      = 112  # ROCmFPx experimental 2-bit S40 codebook layout
 
     GUESSED              = 1024  # not specified in the model file
 
