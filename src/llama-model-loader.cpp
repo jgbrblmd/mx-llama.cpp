@@ -49,6 +49,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4:          name = LLAMA_FTYPE_PREFIX "ROCmFP4";          break;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:     name = LLAMA_FTYPE_PREFIX "ROCmFP4-fast";     break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX:          name = LLAMA_FTYPE_PREFIX "ROCmFP2";          break;
         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX:          name = LLAMA_FTYPE_PREFIX "ROCmFP6";          break;
         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX:          name = LLAMA_FTYPE_PREFIX "ROCmFP8";          break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
@@ -793,6 +794,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             case GGML_TYPE_Q4_0_ROCMFP4:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4;    break;
             case GGML_TYPE_Q4_0_ROCMFP4_FAST: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST; break;
+            case GGML_TYPE_Q2_0_ROCMFPX: ftype = LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX; break;
             case GGML_TYPE_Q6_0_ROCMFPX: ftype = LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX; break;
             case GGML_TYPE_Q8_0_ROCMFPX: ftype = LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX; break;
             default:

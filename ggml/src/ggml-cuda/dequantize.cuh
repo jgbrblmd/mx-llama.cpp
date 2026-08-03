@@ -452,6 +452,19 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
     }
 }
 
+static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
+
+    // Affine fp2: e[0] = scale, e[1] = offset for all 32; value = c*scale - offset
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float scale  = ggml_cuda_ue4m3_to_fp32(x[ib].e[0]);
+    const float offset = ggml_cuda_ue4m3_to_fp32(x[ib].e[1]);
+
+    v.x = scale * (float) ((x[ib].qs[i0/4] >> (2*(i0 % 4))) & 3u) - offset;
+    v.y = scale * (float) ((x[ib].qs[i1/4] >> (2*(i1 % 4))) & 3u) - offset;
+}
+
 static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_rocmfp6_device * x = (const block_rocmfp6_device *) vx;
 
