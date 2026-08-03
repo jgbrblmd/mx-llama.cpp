@@ -674,6 +674,14 @@ void dequantize_row_nvfp4_e8m0(const block_nvfp4_e8m0 * GGML_RESTRICT x, float *
     }
 }
 
+void quantize_row_rocmfpx_fp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp2_ref(x, y, k);
+}
+
+void dequantize_row_rocmfpx_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp2(x, y, k);
+}
+
 void quantize_row_rocmfpx_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k) {
     rocmfpx_quantize_row_fp6_ref(x, y, k);
 }
@@ -5671,6 +5679,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 GGML_UNUSED(nb);
             } break;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            {
+                // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q2_0_ROCMFPX:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);

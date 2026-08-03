@@ -438,8 +438,121 @@ size_t rocmfpx_quantize_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRIC
 }
 
 // ---------------------------------------------------------------------------
+// FP2 helpers (affine "Q2_0_ROCMFP2": e[0] = scale, e[1] = offset for all 32
+// weights; 2-bit codes are literal c in {0,1,2,3}; value = c*scale - offset)
+// ---------------------------------------------------------------------------
+
+static inline uint8_t rocmfpx_quantize_fp2_code(float x, float inv_scale, float offset_over_scale) {
+    if (!isfinite(x)) {
+        return 0;
+    }
+    int c = (int) lroundf(x * inv_scale + offset_over_scale);
+    if (c < 0) { c = 0; }
+    else if (c > 3) { c = 3; }
+    return (uint8_t) c;
+}
+
+static void rocmfpx_quantize_row_fp2_impl(
+        const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y,
+        int64_t k, const float * GGML_RESTRICT quant_weights) {
+    assert(k % QK_ROCMFP2 == 0);
+    GGML_UNUSED(quant_weights);
+
+    const int64_t nb = k / QK_ROCMFP2;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_ROCMFP2;
+        block_rocmfp2 * yb = y + ib;
+
+        // Min/max over finite values: value = c*scale - offset maps code 0 to
+        // -offset and code 3 to 3*scale - offset, so offset = -min and
+        // scale = (max - min)/3 with both bytes on the UE4M3 grid.
+        float mn = INFINITY;
+        float mx = -INFINITY;
+        for (int i = 0; i < QK_ROCMFP2; ++i) {
+            if (isfinite(xb[i])) {
+                mn = fminf(mn, xb[i]);
+                mx = fmaxf(mx, xb[i]);
+            }
+        }
+
+        if (!(mx > mn)) {
+            memset(yb->qs, 0, QS_ROCMFP2);
+            yb->e[0] = 0;
+            yb->e[1] = 0;
+            continue;
+        }
+
+        const float span = mx - mn;
+        const uint8_t e_scale = rocmfpx_nearest_scale_ue4m3(span / 3.0f);
+        const uint8_t e_offset = rocmfpx_nearest_scale_ue4m3(-mn);
+        const float scale = rocmfpx_scale_lookup(e_scale);
+        const float offset = rocmfpx_scale_lookup(e_offset);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        const float offset_over_scale = offset * inv_scale;
+
+        yb->e[0] = e_scale;
+        yb->e[1] = e_offset;
+        for (int packed = 0; packed < 8; ++packed) {
+            uint8_t byte = 0;
+            for (int lane = 0; lane < 4; ++lane) {
+                const int j = 4 * packed + lane;
+                byte |= (uint8_t) (rocmfpx_quantize_fp2_code(xb[j], inv_scale, offset_over_scale) << (2 * lane));
+            }
+            yb->qs[packed] = byte;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp2_ref(
+        const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp2_impl(x, y, k, NULL);
+}
+
+// Affine fp2 (Other U "Q2_0_ROCMFP2"): e[0] = scale for all 32 weights,
+// e[1] = offset for all 32 weights, 2-bit codes are literal c in {0,1,2,3},
+// value = c*scale - offset. Both bytes use the UE4M3 encoding.
+void rocmfpx_dequantize_row_fp2(
+        const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMFP2 == 0);
+    const int64_t nb = k / QK_ROCMFP2;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_rocmfp2 * xb = x + ib;
+        float * yb = y + ib * QK_ROCMFP2;
+        const float scale  = rocmfpx_scale_lookup(xb->e[0]);
+        const float offset = rocmfpx_scale_lookup(xb->e[1]);
+        for (int j = 0; j < QK_ROCMFP2; ++j) {
+            const uint8_t code = (xb->qs[j / 4] >> (2 * (j % 4))) & 3u;
+            yb[j] = (float) code * scale - offset;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp2(
+        const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp2_ref(x, (block_rocmfp2 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp2(
+        const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp2(n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_fp2_impl(
+                src + row * n_per_row, (block_rocmfp2 *) qrow, n_per_row, imatrix);
+        qrow += row_size;
+    }
+    return (size_t) nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
 // Row size helpers
 // ---------------------------------------------------------------------------
+
+size_t rocmfpx_row_size_fp2(int64_t k) {
+    assert(k % QK_ROCMFP2 == 0);
+    return (size_t) (k / QK_ROCMFP2) * sizeof(block_rocmfp2);
+}
 
 size_t rocmfpx_row_size_fp6(int64_t k) {
     assert(k % QK_ROCMFP6 == 0);

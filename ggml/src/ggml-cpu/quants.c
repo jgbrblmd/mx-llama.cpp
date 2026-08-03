@@ -478,6 +478,41 @@ void ggml_vec_dot_rocmfp4_fast_q8_0_generic(int n, float * GGML_RESTRICT s, size
     *s = sumf;
 }
 
+// ROCmFP2 affine (Other U "Q2_0_ROCMFP2"): 32 weights / block, 8 bytes packed
+// 2-bit codes + 2 UE4M3 bytes (e[0] = scale, e[1] = offset for all 32);
+// codes are literal c in {0,1,2,3}; value = c*scale - offset
+void ggml_vec_dot_rocmfpx_fp2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP2 == 0);
+    static_assert(QK_ROCMFP2 == QK8_0, "QK_ROCMFP2 and QK8_0 must be the same");
+
+    const block_rocmfp2 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP2;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = ggml_fp16_to_fp32(y[ib].d);
+        const float dx = rocmfpx_ue4m3_to_fp32(x[ib].e[0]);
+        const float dm = rocmfpx_ue4m3_to_fp32(x[ib].e[1]);
+        int sumc = 0;
+        int sumq = 0;
+        for (int j = 0; j < QK_ROCMFP2; ++j) {
+            const int c = (x[ib].qs[j/4] >> (2*(j % 4))) & 3u;
+            sumc += c * (int) y[ib].qs[j];
+            sumq += (int) y[ib].qs[j];
+        }
+        sumf += dy * (dx * (float) sumc - dm * (float) sumq);
+    }
+
+    *s = sumf;
+}
+
 // ROCmFP6: 32 weights / block, 24 bytes packed 6-bit codes + 2 UE4M3 scale bytes
 static inline uint32_t ggml_rocmfpx_get_bits_cpu(const uint8_t * src, int bit_pos, int nbits) {
     const int byte_pos = bit_pos >> 3;

@@ -587,6 +587,77 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp8_q8_1(
         v, u, ggml_cuda_ue4m3_to_fp32(bq8->e), __low2half(bq8_1->ds));
 }
 
+// ROCmFP2 affine (Other U "Q2_0_ROCMFP2"): 32 weights / block, 8 bytes packed
+// 2-bit codes + 2 UE4M3 bytes (e[0] = scale, e[1] = offset for all 32);
+// codes are literal c in {0,1,2,3}; value = c*scale - offset. One byte == one
+// 4-value group, so group index == q8 int index (both 8 per 32-value block).
+#define VDR_ROCMFP2_Q8_1_MMVQ 4
+#define VDR_ROCMFP2_Q8_1_MMQ  4
+
+static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t packed) {
+#if defined(GGML_USE_HIP)
+    // Spread the low and high code bits independently into the low bits of
+    // four byte selectors.  Separating the planes prevents carries between
+    // adjacent two-bit codes during the multiply.
+    constexpr uint32_t byte_lsb = 0x01010101u;
+    const uint32_t lo = (((uint32_t) packed        & 0x55u) * 0x00041041u) & byte_lsb;
+    const uint32_t hi = ((((uint32_t) packed >> 1) & 0x55u) * 0x00041041u) & byte_lsb;
+    const uint32_t selectors = lo | (hi << 1);
+
+    // v_perm_b32 selector bytes 0..3 choose bytes from the second operand.
+    // The 2-bit codes are the literal values {0, 1, 2, 3}.
+    return __builtin_amdgcn_perm(0u, 0x03020100u, selectors);
+#else
+    int result = 0;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const uint32_t code = (packed >> (2 * lane)) & 3u;
+        result |= ((int) (uint8_t) code) << (8 * lane);
+    }
+    return result;
+#endif
+}
+
+// FP2 MMQ dp4a impl: affine, value = c*scale - offset. d8_0[0] = scale and
+// d8_0[1] = offset for the whole 32-value block. With vdr = QI_ROCMFP2 = 8
+// this processes 1 FP2 block.
+template <int vdr> static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1_mmq_impl(
+    const int * v, const int * u, const float * d8_0, const float & d8_1) {
+
+    int sumc = 0;
+    int sumq = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        // SIMD dot product of quantized values
+        sumc = ggml_cuda_dp4a(v[i], u[i], sumc);
+        // sum of the 4 int8 q8 values per packed int (dp4a with ones)
+        sumq = ggml_cuda_dp4a(0x01010101, u[i], sumq);
+    }
+
+    return d8_1 * (d8_0[0] * (float) sumc - d8_0[1] * (float) sumq);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp2 * bq2 = (const block_rocmfp2 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumc = 0;
+    int sumq = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP2_Q8_1_MMVQ; ++i) {
+        const int values = rocmfpx_pack4_fp2_vec_cuda(bq2->qs[iqs + i]);
+        sumc = ggml_cuda_dp4a(values, q8[i], sumc);
+        sumq = ggml_cuda_dp4a(0x01010101, q8[i], sumq);
+    }
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (ggml_cuda_ue4m3_to_fp32(bq2->e[0]) * (float) sumc - ggml_cuda_ue4m3_to_fp32(bq2->e[1]) * (float) sumq);
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 
