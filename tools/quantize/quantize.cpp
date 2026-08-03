@@ -41,6 +41,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " 4.5 bpw NVFP4 quantization",  },
     { "Q4_0_ROCMFP4",   LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4,   " 4.5 bpw ROCmFP4 quantization",   },
     { "Q4_0_ROCMFP4_FAST",LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST," 4.25 bpw ROCmFP4-fast quantization", },
+    { "Q2_0_ROCMFPX",   LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX,   " 2.5 bpw ROCmFP2 S40 quantization", },
     { "Q6_0_ROCMFPX",   LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX,   " 6.5 bpw ROCmFP6 quantization",   },
     { "Q8_0_ROCMFPX",   LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX,   " 8.25 bpw ROCmFP8 quantization",  },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
