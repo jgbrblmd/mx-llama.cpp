@@ -8922,7 +8922,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // ROCmFPX FP4/FP6/FP8 MUL_MAT tests: CPU reference vs GPU mmq kernel
-    for (ggml_type type_a : {GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
+    for (ggml_type type_a : {GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             std::vector<int> ks = { 256, 1024 };
             for (auto k : ks) {

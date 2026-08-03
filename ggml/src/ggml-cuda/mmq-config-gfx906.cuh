@@ -40,6 +40,11 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
         return ggml_cuda_mmq_config(
             GGML_TYPE_Q8_0_ROCMFPX, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
     }
+    // FP2: 16-wide dp4a path, same I/nthreads as Q8_0 on gfx906
+    if (type == GGML_TYPE_Q2_0_ROCMFPX && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q2_0_ROCMFPX, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
+    }
     // FP6: 16-wide dp4a path, same I/nthreads as Q8_0 on gfx906
     if (type == GGML_TYPE_Q6_0_ROCMFPX && J >= 8 && J <= 128 && (J % 8) == 0) {
         return ggml_cuda_mmq_config(
