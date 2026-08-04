@@ -49,6 +49,14 @@ F32 activations down to bf16, so F32 is both faster and more faithful. Automatic
 no flag. Worth +18-19% prefill on UD / `*_XL` quants that keep BF16 tensors.
 `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute type.
 
+## Quantized activation reuse
+
+Several matmuls usually read one activation (q/k/v off a single attn_norm, the
+router and gate/up off a single ffn_norm), and each quantized it to q8_1 again.
+The quantized copy is now kept and handed to the later matmuls, which is
+bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
+`GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
+
 ## Building from source
 
 Requires a ROCm toolchain with gfx906 support (rocBLAS gfx906 kernels, plus RCCL

@@ -2361,6 +2361,42 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (int ii = 0; ii < cgraph->n_nodes; ii++) {
                     node_index[cgraph->nodes[ii]] = ii;
                 }
+
+                // Dependencies that flow through a persistent buffer instead of an src edge.
+                // A KV-cache write is a SET_ROWS node writing through a view of the cache; the
+                // matching read is a separate view of the same cache. No src edge links them,
+                // and the cache is not a graph node, so the scan below cannot see the
+                // dependency - it skips the read's source as "likely a weight" and leaves the
+                // write stranded on the producing stage's lanes.
+                //
+                // That is a silent wrong answer whenever a stage boundary falls between a
+                // cache write and its read. On DeepSeek-V4 at -tps 4 (2 stages) it cost +1.77%
+                // perplexity: head-splitting attn_q_b makes an attention weight stage-1-owned,
+                // which moves the transition from node 4592 to 4482, in between two writes to
+                // cache_k_l22 and the view that reads them back.
+                auto view_root = [](const ggml_tensor * t) -> const ggml_tensor * {
+                    while (t != nullptr && t->view_src != nullptr) {
+                        t = t->view_src;
+                    }
+                    return t;
+                };
+                std::unordered_map<const ggml_tensor *, std::vector<int>> buffer_writers;
+                for (int ii = 0; ii < cgraph->n_nodes; ii++) {
+                    ggml_tensor * nd = cgraph->nodes[ii];
+                    if (nd->view_src == nullptr) {
+                        continue;   // not an in-place write through a view
+                    }
+                    const ggml_tensor * root = view_root(nd);
+                    if (root == nullptr || root->buffer == nullptr) {
+                        continue;
+                    }
+                    // Only persistent buffers matter. A compute-buffer root lives and dies
+                    // inside one graph and is reached through ordinary src edges anyway.
+                    if (ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                        continue;
+                    }
+                    buffer_writers[root].push_back(ii);
+                }
                 for (size_t s = 0; s < n_subgraphs; s++) {
                     if (backend_ctx->subgraphs[s].closure != ggml_backend_meta_context::subgraph_closure::TRANSFER) {
                         continue;
@@ -2376,7 +2412,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             ggml_tensor * src = node->src[sx];
                             if (src == nullptr) continue;
                             auto it = node_index.find(src);
-                            if (it == node_index.end()) continue; // not a graph node (likely a weight)
+                            if (it == node_index.end()) {
+                                // Not a graph node. It may still be a view of a persistent
+                                // buffer that an earlier node wrote - send those writes, or the
+                                // new stage reads a buffer its lanes never received.
+                                const ggml_tensor * root = view_root(src);
+                                if (root != nullptr) {
+                                    auto wit = buffer_writers.find(root);
+                                    if (wit != buffer_writers.end()) {
+                                        for (int widx : wit->second) {
+                                            if (widx >= boundary_idx) continue;
+                                            ggml_tensor * wnode = cgraph->nodes[widx];
+                                            if (!seen.insert(wnode).second) continue;
+                                            const ggml_backend_meta_split_state wss =
+                                                ggml_backend_meta_get_split_state(wnode, /*assume_sync =*/ true);
+                                            if (wss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) continue;
+                                            xfer.push_back(wnode);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             if (it->second >= boundary_idx) continue; // produced in/after the new stage
                             if (!seen.insert(src).second) continue;
                             // Only MIRRORED tensors need cross-stage broadcast. Sharded tensors
