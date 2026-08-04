@@ -106,7 +106,6 @@ class BailingMoeV3Model(TextModel):
             self.metadata.name, self.metadata.basename, self.metadata.finetune,
             self.metadata.version, size_label=None, output_type=output_type, model_type=None)
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
-
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item

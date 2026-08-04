@@ -2,7 +2,6 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
-
 void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,         hparams.n_embd_head_k_mla_impl);
@@ -400,7 +399,6 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
-
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
