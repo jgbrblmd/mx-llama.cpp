@@ -22,6 +22,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q4_0_ROCMFP4:    return vec_dot_rocmfp4_q8_1;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return vec_dot_rocmfp4_fast_q8_1;
         case GGML_TYPE_Q2_0_ROCMFPX:    return vec_dot_rocmfpx_fp2_q8_1;
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE: return vec_dot_rocmfpx_fp2_affine_q8_1;
         case GGML_TYPE_Q6_0_ROCMFPX:    return vec_dot_rocmfpx_fp6_q8_1;
         case GGML_TYPE_Q8_0_ROCMFPX:    return vec_dot_rocmfpx_fp8_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
@@ -56,7 +57,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_NVFP4_E8M0: return VDR_NVFP4_E8M0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0_ROCMFP4:    return VDR_ROCMFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return VDR_ROCMFP4_FAST_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_0_ROCMFPX:    return VDR_ROCMFP2_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE: return VDR_ROCMFP2_Q8_1_MMVQ;
         case GGML_TYPE_Q6_0_ROCMFPX:    return VDR_ROCMFP6_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0_ROCMFPX:    return VDR_ROCMFP8_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
@@ -149,7 +151,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_Q5_K:    return 5;
         case GGML_TYPE_Q6_K:    return 4;
         case GGML_TYPE_Q8_0:    return 4;
-        case GGML_TYPE_Q2_0_ROCMFPX:    return 4;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE: return 4;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 4;
         default:                return MMVQ_MAX_BATCH_SIZE;
@@ -168,7 +171,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return 7;
         case GGML_TYPE_Q2_K:    return 7;
         case GGML_TYPE_Q3_K:    return 5;
-        case GGML_TYPE_Q2_0_ROCMFPX:    return 7;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE: return 7;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 7;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 7;
         default:                return MMVQ_MAX_BATCH_SIZE;
@@ -194,7 +198,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type t
         case GGML_TYPE_Q5_K:    return 4;
         case GGML_TYPE_Q6_K:    return 4;
         case GGML_TYPE_Q8_0:    return 4;
-        case GGML_TYPE_Q2_0_ROCMFPX:    return 4;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE: return 4;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 4;
         default:                return MMVQ_MAX_BATCH_SIZE;
@@ -1116,6 +1121,15 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q2_0_ROCMFPX:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0_ROCMFPX>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        // affine fp2 has its own constexpr vec_dot dispatch inside the kernel
+        // (get_vec_dot_q_cuda selects the kernel per template type), so it must
+        // use a distinct template instance or it silently runs the S40 kernel.
+        case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0_ROCMFPX_AFFINE>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
