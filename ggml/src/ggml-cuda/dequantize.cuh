@@ -455,6 +455,20 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
 static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
 
+    // S40 fp2: e[0]/e[1] = per-half UE4M3 scales; codes map through {-4, -1, +1, +4}
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i0 >= QK_ROCMFP2/2]);
+    const float d1 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i1 >= QK_ROCMFP2/2]);
+
+    static const int8_t values[4] = { -4, -1, 1, 4 };
+    v.x = d0 * (float) values[(x[ib].qs[i0/4] >> (2*(i0 % 4))) & 3u];
+    v.y = d1 * (float) values[(x[ib].qs[i1/4] >> (2*(i1 % 4))) & 3u];
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp2_affine(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
+
     // Affine fp2: e[0] = scale, e[1] = offset for all 32; value = c*scale - offset
     const int i0 = iqs + 0;
     const int i1 = iqs + 1;
