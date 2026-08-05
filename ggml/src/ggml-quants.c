@@ -682,6 +682,14 @@ void dequantize_row_rocmfpx_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * G
     rocmfpx_dequantize_row_fp2(x, y, k);
 }
 
+void quantize_row_rocmfpx_fp2_affine_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp2_affine_ref(x, y, k);
+}
+
+void dequantize_row_rocmfpx_fp2_affine(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp2_affine(x, y, k);
+}
+
 void quantize_row_rocmfpx_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k) {
     rocmfpx_quantize_row_fp6_ref(x, y, k);
 }
