@@ -159,4 +159,45 @@ void tp_custom_ar_allreduce(CustomARContext * ctx,
                             int      nranks,
                             cudaStream_t * streams);
 
+// Split form of the call above, for callers that want each rank's kernel issued
+// by the thread that already owns that rank's stream and already has that
+// device current. Issuing all N from one thread costs N host launches plus N
+// device switches at every AllReduce, and with one AllReduce per subgraph that
+// fan-out is a measurable share of the token.
+//
+// tp_custom_ar_prepare does every piece of shared host-side work - staging
+// (re)allocation, RankData upload, path selection, grid sizing - and must be
+// called ONCE from a single thread before any launch_rank for that plan.
+// tp_custom_ar_launch_rank then issues only that rank's kernel and mutates no
+// shared state, so the N calls may run concurrently on N threads.
+//
+// The plan borrows ctx and the caller pointer/stream arrays by value, so it is
+// valid only until the next prepare on the same ctx.
+struct CustomARPlan {
+    CustomARContext * ctx        = nullptr;
+    float *           inputs [kMaxRanks] = {};
+    float *           outputs[kMaxRanks] = {};
+    cudaStream_t      streams[kMaxRanks] = {};
+    // Ranks whose input tensor was not computed by their own lane must have it
+    // zeroed before the collective reads it. Recorded here rather than issued
+    // during prepare so it lands after that lane's subgraph.
+    void *            zero_ptr[kMaxRanks] = {};
+    size_t            zero_bytes = 0;
+    int64_t           n_elements = 0;
+    int               nranks     = 0;
+    int               blocks     = 0;
+    bool              twoshot    = false;
+    bool              broadcast  = false;
+};
+
+void tp_custom_ar_prepare(CustomARContext * ctx,
+                          float ** input_ptrs,
+                          float ** output_ptrs,
+                          int64_t  n_elements,
+                          int      nranks,
+                          cudaStream_t * streams,
+                          CustomARPlan * plan);
+
+void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank);
+
 } // namespace ggml_cuda_tp

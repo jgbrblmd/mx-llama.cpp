@@ -30,6 +30,31 @@ KV staging, a KV-only prefill replay, disabling the draft context's pipeline rin
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
 
+## Concurrent lane dispatch
+
+Under `-sm tensor` the meta backend issued each subgraph to its GPUs in device
+order, so the AllReduce closing it waited on the last one, and with 80 to 130
+such subgraphs per token depending on the model, that stagger was rebuilt at
+every one. The lanes are now
+issued concurrently, which is bit-exact. The gain tracks how many GPUs share one
+tensor-parallel group: measured on Qwen3.6-35B-A3B, +32% token generation on an
+8-GPU tensor split and +2.5% on 4, with prefill flat. Under multi-stage `-tps`
+it follows the group size rather than the total GPU count. On by default;
+`GGML_META_PARALLEL_DISPATCH=0` restores the serial issue. Inert unless at least
+two GPUs share a tensor split. CUDA / ROCm sub-backends only.
+
+## Whole-token graph capture
+
+A decode token under `-sm tensor` made one host round trip per AllReduce-bounded
+subgraph (80 to 130 per token depending on the model), and the collective billed
+the host submission spread at each. Each GPU now records its whole token (subgraph, AllReduce, subgraph, and
+so on) into a single CUDA or HIP graph and replays that once per token, which is
+bit-exact. Worth +6% token generation on a 4-GPU tensor split, on both a MoE and
+a dense model. On 8 GPUs the throughput gain is small but run-to-run spread
+drops from 11% to 2.5%. Prefill is unchanged by design. On by default;
+`GGML_META_TOKEN_GRAPH=0` restores the per-subgraph dispatch. Requires the
+concurrent lane dispatch above. Validated on gfx906.
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point

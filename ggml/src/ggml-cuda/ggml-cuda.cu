@@ -991,6 +991,12 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 struct ggml_backend_cuda_comm_context {
     using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
 
+    // Plan for the split custom-AR path. Filled by allreduce_prepare and
+    // consumed by allreduce_launch_rank. One per communicator is enough: the
+    // meta backend runs at most one AllReduce per stage at a time, and every
+    // rank's launch happens before the next prepare on the same context.
+    ggml_cuda_tp::CustomARPlan ar_plan;
+
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
@@ -1101,8 +1107,12 @@ struct ggml_backend_cuda_comm_context {
     }
 };
 
-static bool ggml_backend_cuda_comm_allreduce_custom(
+// Shared setup + eligibility for the custom AR path. On success the per-rank
+// kernels have NOT been issued yet - comm_ctx->ar_plan describes them.
+// ar_plan.nranks == 0 means "eligible, but there is nothing to launch".
+static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    comm_ctx->ar_plan.nranks = 0;
     if (!comm_ctx->use_custom_ar) {
         return false;
     }
@@ -1166,13 +1176,6 @@ static bool ggml_backend_cuda_comm_allreduce_custom(
         return false;
     }
 
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            ggml_cuda_set_device(cuda_ctx->device);
-            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
-        }
-    }
 
     // Both AR kernels read through per-rank fine-grained staging (allocated
     // inside tp_custom_ar_allreduce) and write the reduced result straight
@@ -1190,9 +1193,56 @@ static bool ggml_backend_cuda_comm_allreduce_custom(
         streams[i]     = cuda_ctx->stream();
     }
 
-    ggml_cuda_tp::tp_custom_ar_allreduce(
-        &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams);
+    ggml_cuda_tp::tp_custom_ar_prepare(
+        &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
+        &comm_ctx->ar_plan);
+
+    // Deferred to launch_rank so it is ordered after that lane's subgraph even
+    // when prepare runs ahead of the lanes (fused dispatch).
+    for (size_t i = 0; i < n_backends; ++i) {
+        comm_ctx->ar_plan.zero_ptr[i] =
+            ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) ? tensors[i]->data : nullptr;
+    }
+    comm_ctx->ar_plan.zero_bytes = ggml_nbytes(tensors[0]);
     return true;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_custom(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (!ggml_backend_cuda_comm_allreduce_custom_prepare(comm_ctx, tensors)) {
+        return false;
+    }
+    for (int rank = 0; rank < comm_ctx->ar_plan.nranks; rank++) {
+        ggml_cuda_tp::tp_custom_ar_launch_rank(&comm_ctx->ar_plan, rank);
+    }
+    return true;
+}
+
+// Split entry points for the meta backend's fused lane dispatch.
+//   returns < 0 : not eligible, caller must use ggml_backend_comm_allreduce_tensor
+//   returns   0 : eligible, nothing to launch
+//   returns > 0 : number of ranks the caller must issue via launch_rank
+static int ggml_backend_cuda_comm_allreduce_prepare(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return -1;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (!ggml_backend_cuda_comm_allreduce_custom_prepare(comm_ctx, tensors)) {
+        return -1;
+    }
+    // One-shot stages the input with an async copy issued during prepare, which
+    // the fused caller runs before the lanes enqueue their subgraphs - that copy
+    // would then read data the subgraph has not written yet. Only the
+    // peer-write kernels (broadcast/twoshot) stage inside the kernel itself.
+    if (comm_ctx->ar_plan.nranks > 0 && !comm_ctx->ar_plan.broadcast) {
+        return -1;
+    }
+    return comm_ctx->ar_plan.nranks;
+}
+
+static void ggml_backend_cuda_comm_allreduce_launch_rank(void * comm_ctx_v, int rank) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    ggml_cuda_tp::tp_custom_ar_launch_rank(&comm_ctx->ar_plan, rank);
 }
 
 #ifdef GGML_USE_NCCL
@@ -4817,6 +4867,17 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// Set while an OUTER capture (a whole-token graph) is recording this stream.
+// The per-subgraph graph path must not run then: nested capture is illegal, and
+// the outer graph already captures every kernel the direct path emits.
+#if defined(GGML_USE_HIP)
+#define AR_CAPTURE_MODE_TL hipStreamCaptureModeThreadLocal
+#else
+#define AR_CAPTURE_MODE_TL cudaStreamCaptureModeThreadLocal
+#endif
+
+static thread_local bool g_cuda_outer_capture = false;
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4835,7 +4896,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && !g_cuda_outer_capture) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6076,6 +6137,51 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Begin recording every kernel this thread issues on `backend`'s stream.
+// ThreadLocal mode so the N lanes can capture their own streams concurrently.
+static bool ggml_backend_cuda_token_capture_begin(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    g_cuda_outer_capture = true;
+    if (cudaStreamBeginCapture(cuda_ctx->stream(), AR_CAPTURE_MODE_TL) != cudaSuccess) {
+        g_cuda_outer_capture = false;
+        return false;
+    }
+    return true;
+}
+
+// Finish the recording and instantiate it. Returns nullptr on failure, in which
+// case the caller must fall back to ordinary per-subgraph dispatch.
+static void * ggml_backend_cuda_token_capture_end(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaGraph_t captured = nullptr;
+    const cudaError_t e = cudaStreamEndCapture(cuda_ctx->stream(), &captured);
+    g_cuda_outer_capture = false;
+    if (e != cudaSuccess || captured == nullptr) {
+        return nullptr;
+    }
+    cudaGraphExec_t exec = nullptr;
+    if (cudaGraphInstantiate(&exec, captured, nullptr, nullptr, 0) != cudaSuccess) {
+        cudaGraphDestroy(captured);
+        return nullptr;
+    }
+    cudaGraphDestroy(captured);
+    return (void *) exec;
+}
+
+static void ggml_backend_cuda_token_graph_launch(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
+}
+
+static void ggml_backend_cuda_token_graph_free(ggml_backend_t backend, void * exec) {
+    GGML_UNUSED(backend);
+    if (exec != nullptr) {
+        cudaGraphExecDestroy((cudaGraphExec_t) exec);
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6086,6 +6192,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_prepare") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_prepare;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_launch_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_launch_rank;
+    }
+    if (strcmp(name, "ggml_backend_token_capture_begin") == 0) {
+        return (void *)ggml_backend_cuda_token_capture_begin;
+    }
+    if (strcmp(name, "ggml_backend_token_capture_end") == 0) {
+        return (void *)ggml_backend_cuda_token_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_token_graph_launch") == 0) {
+        return (void *)ggml_backend_cuda_token_graph_launch;
+    }
+    if (strcmp(name, "ggml_backend_token_graph_free") == 0) {
+        return (void *)ggml_backend_cuda_token_graph_free;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_sendrecv_tensor") == 0) {
