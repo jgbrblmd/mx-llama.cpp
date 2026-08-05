@@ -320,6 +320,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q2_0_ROCMFPX_AFFINE] = {
+        .from_float               = rocmfpx_quantize_row_fp2_affine,
+        .vec_dot                  = ggml_vec_dot_rocmfpx_fp2_affine_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q6_0_ROCMFPX] = {
         .from_float               = rocmfpx_quantize_row_fp6,
         .vec_dot                  = ggml_vec_dot_rocmfpx_fp6_q8_0,
@@ -1516,7 +1522,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const enum ggml_type type = src0->type;
-
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 

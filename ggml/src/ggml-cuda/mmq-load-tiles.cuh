@@ -1925,16 +1925,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_rocmfp2 * bxi = (const block_rocmfp2 *) x + kbx0 + i*stride;
 
         // Each FP2 block (32 values, QI_ROCMFP2=8 groups of 4, one byte per
-        // group) occupies 8 positions.
+        // group) occupies 8 positions. The affine variant uses literal codes
+        // {0,1,2,3} instead of the S40 mapping.
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #pragma unroll
         for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
-            x_qs[i*sram_stride + k + kqsx] = rocmfpx_pack4_fp2_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx]);
+            x_qs[i*sram_stride + k + kqsx] = type == GGML_TYPE_Q2_0_ROCMFPX_AFFINE
+                ? rocmfpx_pack4_fp2_affine_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx])
+                : rocmfpx_pack4_fp2_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx]);
         }
 #else
 #pragma unroll
         for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k + kqsx] = rocmfpx_pack4_fp2_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx]);
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k + kqsx] = type == GGML_TYPE_Q2_0_ROCMFPX_AFFINE
+                ? rocmfpx_pack4_fp2_affine_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx])
+                : rocmfpx_pack4_fp2_vec_cuda((bxi + k/QI_ROCMFP2)->qs[kqsx]);
         }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }

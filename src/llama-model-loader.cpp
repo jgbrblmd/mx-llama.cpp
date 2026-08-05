@@ -6,6 +6,8 @@
 #include "llama-hparams.h"
 #include "llama.h"
 
+#include "../ggml/rocmfpx/rocmfpx.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -603,10 +605,38 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
+        // Q2_0_ROCMFPX variant detection runs once per loader instance (the
+        // model is loaded twice: once virtual for sizing, once for real).
+        bool fp2_affine_detected = false;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
             if (is_modelopt_nvfp4 && cur->type == GGML_TYPE_NVFP4) {
                 cur->type = GGML_TYPE_NVFP4_E8M0;
+            }
+            // Q2_0_ROCMFPX has two bitstream variants sharing the same block
+            // layout: the S40 codebook layout (type 107) and the affine
+            // scale+offset layout (type 108) used by other engines. Detect
+            // the variant once from the first fp2 tensor's data and remap
+            // the whole file consistently.
+            if (cur->type == GGML_TYPE_Q2_0_ROCMFPX && !fp2_affine_detected) {
+                fp2_affine_detected = true;
+                const int64_t tid = gguf_find_tensor(metadata, cur->name);
+                if (tid >= 0) {
+                    const size_t offs = gguf_get_data_offset(metadata) + gguf_get_tensor_offset(metadata, tid);
+                    const size_t nbytes = std::min((size_t) ggml_nbytes(cur), (size_t) (16384 * sizeof(block_rocmfp2)));
+                    std::vector<uint8_t> sample(nbytes);
+                    llama_file * f = files.back().get();
+                    f->seek(offs, SEEK_SET);
+                    f->read_raw(sample.data(), nbytes);
+                    if (rocmfpx_fp2_is_affine(sample.data(), nbytes)) {
+                        LLAMA_LOG_INFO("%s: detected affine Q2_0_ROCMFPX variant, remapping to q2_0_rocmfpx_affine\n", __func__);
+                        for (ggml_tensor * t2 = ggml_get_first_tensor(ctx); t2; t2 = ggml_get_next_tensor(ctx, t2)) {
+                            if (t2->type == GGML_TYPE_Q2_0_ROCMFPX) {
+                                t2->type = GGML_TYPE_Q2_0_ROCMFPX_AFFINE;
+                            }
+                        }
+                    }
+                }
             }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {

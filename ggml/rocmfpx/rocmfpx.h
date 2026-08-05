@@ -30,12 +30,19 @@ extern "C" {
 #define QI_ROCMFP8 (QK_ROCMFP8 / (4 * QR_ROCMFP8))
 
 // ROCmFP2/6/8 block layouts. GGUF/CPU storage uses the compact packed format.
-// ROCmFP2 affine: 32 weights = 8 bytes of packed 2-bit codes + 2 UE4M3 bytes
-// (e[0] = scale, e[1] = offset for all 32; value = c*scale - offset).
+// ROCmFP2 S40: 32 weights = 8 bytes of packed 2-bit codes + 2 UE4M3 scale
+// bytes (e[0] for weights 0..15, e[1] for weights 16..31). Codes map through
+// the frozen MORD code order {-4, -1, +1, +4}; value = code_value * scale.
 typedef struct {
     uint8_t qs[QS_ROCMFP2];
     uint8_t e[2];
 } block_rocmfp2;
+
+// ROCmFP2 S40 code order {-4, -1, +1, +4}
+static inline int rocmfpx_decode_fp2_code(uint8_t code) {
+    static const int8_t values[4] = { -4, -1, 1, 4 };
+    return values[code & 3u];
+}
 
 typedef struct {
     uint8_t qs[QS_ROCMFP6];
@@ -67,6 +74,13 @@ GGML_API void   rocmfpx_quantize_row_fp2_ref(const float * GGML_RESTRICT x, bloc
 GGML_API void   rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_quantize_row_fp2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 GGML_API size_t rocmfpx_quantize_fp2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+// affine fp2 variant (value = c*scale - offset, e[0] = scale, e[1] = offset)
+GGML_API void   rocmfpx_quantize_row_fp2_affine_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_dequantize_row_fp2_affine(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_quantize_row_fp2_affine(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API size_t rocmfpx_quantize_fp2_affine(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+// detect the fp2 variant from block data: true = affine, false = S40 codebook
+GGML_API bool   rocmfpx_fp2_is_affine(const uint8_t * data, size_t nbytes);
 
 GGML_API void   rocmfpx_quantize_row_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_dequantize_row_fp6(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
