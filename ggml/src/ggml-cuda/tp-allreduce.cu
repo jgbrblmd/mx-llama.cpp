@@ -2,6 +2,14 @@
 
 #include <type_traits>
 
+#if defined(GGML_USE_HIP)
+#define AR_MEMCPY_FROM_SYMBOL hipMemcpyFromSymbol
+#define AR_MEMCPY_TO_SYMBOL   hipMemcpyToSymbol
+#else
+#define AR_MEMCPY_FROM_SYMBOL cudaMemcpyFromSymbol
+#define AR_MEMCPY_TO_SYMBOL   cudaMemcpyToSymbol
+#endif
+
 namespace ggml_cuda_tp {
 
 // ============================================================================
@@ -270,6 +278,11 @@ k_cross_device_reduce_1stage(
 // low latency). Same aggregate BW as one-shot reads, but writes typically
 // beat reads on PCIe 3.0.
 // ----------------------------------------------------------------------------
+// [0]=peer-write, [1]=barrier_start wait, [2]=reduce, [3]=barrier_end,
+// [4]=sample count. Ticks are shader-clock, so only RATIOS are meaningful.
+__device__ unsigned long long g_ar_ktime[5] = {0, 0, 0, 0, 0};
+__device__ int                g_ar_ktime_on = 0;
+
 template <int NRANKS>
 __global__ void __launch_bounds__(kThreads, 1)
 k_broadcast_reduce(
@@ -282,6 +295,10 @@ k_broadcast_reduce(
         int64_t                  n_elements) {
 
     auto dp = *_dp;
+
+    const bool ktm = (g_ar_ktime_on != 0) && (blockIdx.x == 0) && (threadIdx.x == 0);
+    unsigned long long kt0 = 0, kt1 = 0, kt2 = 0;
+    if (ktm) { kt0 = clock64(); }
 
     // Phase 1: write our input into each PEER's staging at offset rank*n_elements.
     // We do NOT write the self-slot. Writing the self-slot would be a local
@@ -326,9 +343,13 @@ k_broadcast_reduce(
     // PPL drift that the atomic-alone variant had at ubatch=32.
     __threadfence_system();
 
+    if (ktm) { kt1 = clock64(); }
+
     // Barrier: SYSTEM-scope RELEASE flag store is itself a peer write; PCIe
     // same-source ordering guarantees our prior data writes arrive first.
     barrier_start<NRANKS>(sg, self_sg, rank);
+
+    if (ktm) { kt2 = clock64(); }
 
     // Phase 2: identical reduction order on EVERY rank:
     //   sum = 0 + p0 + p1 + p2 + ... + p_{N-1}
@@ -387,7 +408,19 @@ k_broadcast_reduce(
         result[idx] = sum;
     }
 
+    unsigned long long kt3 = 0;
+    if (ktm) { kt3 = clock64(); }
+
     barrier_end<NRANKS>(sg, self_sg, rank);
+
+    if (ktm) {
+        const unsigned long long kt4 = clock64();
+        atomicAdd(&g_ar_ktime[0], kt1 - kt0);
+        atomicAdd(&g_ar_ktime[1], kt2 - kt1);
+        atomicAdd(&g_ar_ktime[2], kt3 - kt2);
+        atomicAdd(&g_ar_ktime[3], kt4 - kt3);
+        atomicAdd(&g_ar_ktime[4], 1ULL);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -680,6 +713,24 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids) {
 }
 
 void tp_custom_ar_destroy(CustomARContext * ctx) {
+    if (getenv("GGML_TP_AR_KTIMING") != nullptr && ctx->initialized) {
+        for (int r = 0; r < ctx->nranks; r++) {
+            unsigned long long h[5] = {0, 0, 0, 0, 0};
+            ggml_cuda_set_device(ctx->dev_ids[r]);
+            if (AR_MEMCPY_FROM_SYMBOL(h, g_ar_ktime, sizeof(h)) != cudaSuccess || h[4] == 0) {
+                continue;
+            }
+            const double tot = (double) (h[0] + h[1] + h[2] + h[3]);
+            const double n   = (double) h[4];
+            fprintf(stderr,
+                "[ar-ktime] rank %d calls=%llu | write=%.1f%% bar_start=%.1f%% reduce=%.1f%% "
+                "bar_end=%.1f%% | ticks/call: write=%.0f bar_start=%.0f reduce=%.0f bar_end=%.0f\n",
+                r, (unsigned long long) h[4],
+                100.0 * h[0] / tot, 100.0 * h[1] / tot, 100.0 * h[2] / tot, 100.0 * h[3] / tot,
+                h[0] / n, h[1] / n, h[2] / n, h[3] / n);
+        }
+    }
+
     if (!ctx->initialized) return;
 
     for (int rank = 0; rank < ctx->nranks; rank++) {
@@ -714,12 +765,13 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
     ctx->initialized = false;
 }
 
-void tp_custom_ar_allreduce(CustomARContext * ctx,
-                            float ** input_ptrs,
-                            float ** output_ptrs,
-                            int64_t  n_elements,
-                            int      nranks,
-                            cudaStream_t * streams) {
+void tp_custom_ar_prepare(CustomARContext * ctx,
+                          float ** input_ptrs,
+                          float ** output_ptrs,
+                          int64_t  n_elements,
+                          int      nranks,
+                          cudaStream_t * streams,
+                          CustomARPlan * plan) {
     GGML_ASSERT(ctx->initialized);
     GGML_ASSERT(nranks == ctx->nranks);
     GGML_ASSERT(nranks >= 2 && nranks <= kMaxRanks);
@@ -837,49 +889,93 @@ void tp_custom_ar_allreduce(CustomARContext * ctx,
     const int64_t packed_size = n_elements / 4;
     int blocks = std::min(blocks_cap, std::max(1, (int)((packed_size + kThreads - 1) / kThreads)));
 
+    // Everything above is shared setup. Record what a per-rank launch needs so
+    // the kernels can be issued one rank at a time, from any thread.
+    static const int s_ktiming = []{
+        const char * e = getenv("GGML_TP_AR_KTIMING");
+        return (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }();
+    if (s_ktiming) {
+        static bool uploaded = false;
+        if (!uploaded) {
+            uploaded = true;
+            for (int r = 0; r < nranks; r++) {
+                ggml_cuda_set_device(ctx->dev_ids[r]);
+                CUDA_CHECK(AR_MEMCPY_TO_SYMBOL(g_ar_ktime_on, &s_ktiming, sizeof(int)));
+            }
+        }
+    }
+
+    plan->ctx        = ctx;
+    plan->n_elements = n_elements;
+    plan->nranks     = nranks;
+    plan->blocks     = blocks;
+    plan->twoshot    = s_twoshot;
+    plan->broadcast  = s_broadcast;
+    for (int rank = 0; rank < nranks; rank++) {
+        plan->inputs [rank] = input_ptrs [rank];
+        plan->outputs[rank] = output_ptrs[rank];
+        plan->streams[rank] = streams    [rank];
+    }
+}
+
+void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
+    CustomARContext * ctx = plan->ctx;
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(rank >= 0 && rank < plan->nranks);
+
+    const int     nranks     = plan->nranks;
+    const int     blocks     = plan->blocks;
+    const int64_t n_elements = plan->n_elements;
+
+    ggml_cuda_set_device(ctx->dev_ids[rank]);
+
+    if (plan->zero_ptr[rank] != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(plan->zero_ptr[rank], 0, plan->zero_bytes,
+                                   plan->streams[rank]));
+    }
+
     // Per-N kernel launches. The dispatcher below recursively matches `nranks`
     // against compile-time N from kMaxRanks down to 2; the compiler folds the
     // chain into a jump table at -O2. Adding ranks just means bumping
     // kMaxRanks — the templates instantiate automatically.
-    auto launch_peer = [&](auto N_CONST) {
-        constexpr int N = decltype(N_CONST)::value;
-        for (int rank = 0; rank < nranks; rank++) {
-            ggml_cuda_set_device(ctx->dev_ids[rank]);
-            if (s_twoshot) {
-                k_twoshot_f32<N><<<blocks, kThreads, 0, streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
-                    input_ptrs[rank], output_ptrs[rank], rank, n_elements);
-            } else {
-                k_broadcast_reduce<N><<<blocks, kThreads, 0, streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
-                    input_ptrs[rank], output_ptrs[rank], rank, n_elements);
-            }
-            CUDA_CHECK(cudaGetLastError());
-        }
-    };
-    auto launch_oneshot = [&](auto N_CONST) {
-        constexpr int N = decltype(N_CONST)::value;
-        for (int rank = 0; rank < nranks; rank++) {
-            ggml_cuda_set_device(ctx->dev_ids[rank]);
-            k_cross_device_reduce_1stage<N><<<blocks, kThreads, 0, streams[rank]>>>(
-                ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
-                output_ptrs[rank], rank, n_elements);
-            CUDA_CHECK(cudaGetLastError());
-        }
-    };
-
     auto dispatch = [&](auto self, auto N_CONST) -> void {
         constexpr int N = decltype(N_CONST)::value;
         if constexpr (N < 2) {
             GGML_ABORT("TP custom AR: unsupported nranks=%d (must be 2..%d)\n", nranks, kMaxRanks);
         } else if (nranks == N) {
-            if (s_broadcast) launch_peer(N_CONST);
-            else             launch_oneshot(N_CONST);
+            if (!plan->broadcast) {
+                k_cross_device_reduce_1stage<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->outputs[rank], rank, n_elements);
+            } else if (plan->twoshot) {
+                k_twoshot_f32<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements);
+            } else {
+                k_broadcast_reduce<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements);
+            }
+            CUDA_CHECK(cudaGetLastError());
         } else {
             self(self, std::integral_constant<int, N - 1>{});
         }
     };
     dispatch(dispatch, std::integral_constant<int, kMaxRanks>{});
+}
+
+void tp_custom_ar_allreduce(CustomARContext * ctx,
+                            float ** input_ptrs,
+                            float ** output_ptrs,
+                            int64_t  n_elements,
+                            int      nranks,
+                            cudaStream_t * streams) {
+    CustomARPlan plan;
+    tp_custom_ar_prepare(ctx, input_ptrs, output_ptrs, n_elements, nranks, streams, &plan);
+    for (int rank = 0; rank < nranks; rank++) {
+        tp_custom_ar_launch_rank(&plan, rank);
+    }
 }
 
 } // namespace ggml_cuda_tp
