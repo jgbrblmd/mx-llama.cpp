@@ -1381,6 +1381,55 @@ void analyze_tools::extract_argument_value_markers() {
                 value_suffix = value_suffix.substr(0, end_marker_pos);
             }
         }
+
+        // The one-arg comparison above only sees the LAST value's suffix, which
+        // may carry trailing whitespace that belongs to the call closer and not
+        // to the value suffix itself (e.g. Bailing renders "</arg_value>\n"
+        // before "</tool_call>" but "</arg_value><arg_key>" between args).
+        // Cross-check against the one-vs-two-args diff: its right side begins
+        // with the authoritative inter-arg suffix, so use it when it is a
+        // strict prefix of the candidate.
+        if (!arguments.name_prefix.empty()) {
+            json assistant_one_arg = json{
+                { "role",       "assistant" },
+                { "content",    ""          },
+                { "tool_calls", json::array({ first_tool_call_one_arg }) }
+            };
+
+            json assistant_two_args = json{
+                { "role",       "assistant" },
+                { "content",    ""          },
+                { "tool_calls", json::array({ first_tool_call }) }
+            };
+
+            template_params params2;
+            params2.messages              = json::array({ user_msg, assistant_one_arg });
+            params2.tools                 = tools;
+            params2.add_generation_prompt = false;
+            params2.enable_thinking       = true;
+
+            auto comparison2 = compare_variants(
+                *tmpl, params2, [&](template_params & p) {
+                    p.messages = json::array({ user_msg, assistant_two_args });
+                });
+
+            if (comparison2) {
+                const std::string & inter = comparison2->diff.right;
+                size_t pos = inter.find(arguments.name_prefix);
+                if (pos != std::string::npos && pos > 0) {
+                    std::string inter_suffix = inter.substr(0, pos);
+                    if (value_suffix.size() > inter_suffix.size() &&
+                        value_suffix.compare(0, inter_suffix.size(), inter_suffix) == 0) {
+                        value_suffix = inter_suffix;
+                        // The trimmed whitespace belongs to the call closer
+                        // (e.g. Bailing renders "</arg_value>\n</tool_call>"),
+                        // so the close must tolerate optional leading space.
+                        arguments.tolerate_intertag_whitespace = true;
+                    }
+                }
+            }
+        }
+
         if (!trim_whitespace(value_suffix).empty()) {
             arguments.value_suffix = value_suffix;
         }
