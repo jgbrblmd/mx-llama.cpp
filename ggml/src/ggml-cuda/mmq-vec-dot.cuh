@@ -494,9 +494,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-// ROCmFP2 dp4a MMQ: 2 floats per block (scale at x_df[+0], offset at
-// x_df[+1]), QI_ROCMFP2=8 groups, so the tile layout and k01 walk match
-// load_tiles_rocmfpx_fp2; the impl applies value = c*scale - offset.
+// ROCmFP2 dp4a MMQ: 2 floats per block (e[0] at x_df[+0], e[1] at x_df[+1]),
+// QI_ROCMFP2=8 groups, so the tile layout and k01 walk match
+// load_tiles_rocmfpx_fp2; the impl applies value = code_value * half_scale.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmfpx_fp2_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -521,6 +521,40 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 const int i = i0 + threadIdx.x;
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_rocmfpx_fp2_q8_1_mmq_impl<QI_ROCMFP2>(
+                    &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
+                    &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
+                    &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + (k0/QI8_0)*2],
+                    y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
+            }
+        }
+    }
+}
+
+// affine fp2 variant: d8_0[0] = scale, d8_0[1] = offset for the whole block
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmfpx_fp2_affine_q8_1_dp4a(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI_ROCMFP2) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_rocmfpx_fp2_affine_q8_1_mmq_impl<QI_ROCMFP2>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
                     &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
                     &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + (k0/QI8_0)*2],

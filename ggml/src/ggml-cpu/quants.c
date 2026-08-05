@@ -478,10 +478,47 @@ void ggml_vec_dot_rocmfp4_fast_q8_0_generic(int n, float * GGML_RESTRICT s, size
     *s = sumf;
 }
 
-// ROCmFP2 affine (Other U "Q2_0_ROCMFP2"): 32 weights / block, 8 bytes packed
-// 2-bit codes + 2 UE4M3 bytes (e[0] = scale, e[1] = offset for all 32);
-// codes are literal c in {0,1,2,3}; value = c*scale - offset
+// ROCmFP2 S40: 32 weights / block, 8 bytes packed 2-bit codes + 2 UE4M3
+// scale bytes (e[0] for weights 0..15, e[1] for weights 16..31); codes map
+// through the frozen MORD order {-4, -1, +1, +4}; value = code_value * scale
 void ggml_vec_dot_rocmfpx_fp2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ROCMFP2 == 0);
+    static_assert(QK_ROCMFP2 == QK8_0, "QK_ROCMFP2 and QK8_0 must be the same");
+
+    const block_rocmfp2 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_ROCMFP2;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = ggml_fp16_to_fp32(y[ib].d);
+        int sumc0 = 0;
+        int sumc1 = 0;
+        for (int half = 0; half < 2; ++half) {
+            int * sumc = half == 0 ? &sumc0 : &sumc1;
+            for (int j = 0; j < QK_ROCMFP2 / 2; ++j) {
+                const int idx = half * (QK_ROCMFP2 / 2) + j;
+                const int c = (x[ib].qs[idx/4] >> (2*(idx % 4))) & 3u;
+                *sumc += rocmfpx_decode_fp2_code(c) * (int) y[ib].qs[idx];
+            }
+        }
+        const float dx0 = rocmfpx_ue4m3_to_fp32(x[ib].e[0]);
+        const float dx1 = rocmfpx_ue4m3_to_fp32(x[ib].e[1]);
+        sumf += dy * (dx0 * (float) sumc0 + dx1 * (float) sumc1);
+    }
+
+    *s = sumf;
+}
+
+// ROCmFP2 affine variant: e[0] = scale, e[1] = offset for all 32; codes are
+// literal c in {0,1,2,3}; value = c*scale - offset
+void ggml_vec_dot_rocmfpx_fp2_affine_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
