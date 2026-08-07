@@ -23,8 +23,10 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb1,
                                      int64_t       sb2,
                                      int64_t       sb3,
+                                     const uint3   neqk1_magic,
                                      const uint3   rq1_magic,
                                      const uint3   rq3_magic,
+                                     bool          interleaved,
                                      float         scale,
                                      int64_t       state_slot_stride,
                                      int           K) {
@@ -34,11 +36,13 @@ gated_delta_net_cuda(const float * q,
     const int      lane     = threadIdx.x;
     const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
 
-    // v-head h_idx pairs with k-head h_idx / r (r = H_v / H_k): the model
-    // expands q/k in grouped order (MLX mx.repeat; the CPU path concatenates
-    // each k-head r times). h_idx % H_k would be the tiled order, which
-    // scrambles every head with h % H_k != h / r when H_v != H_k.
-    const uint32_t iq1 = fastdiv(h_idx, rq1_magic);
+    // The v-head h_idx -> (q,k)-head pairing convention is checkpoint-defined
+    // (fixed at conversion time). The convert script reorders V heads to tiled
+    // order (v-head h pairs with k-head h % H_k, ggml_repeat broadcast order),
+    // while MLX/u32 checkpoints keep the grouped layout (v-head h pairs with
+    // k-head h / r, mx.repeat / repeat_interleave order). Set via
+    // ggml_gated_delta_net_set_bcast(); default tiled.
+    const uint32_t iq1 = interleaved ? fastdiv(h_idx, rq1_magic) : fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     float *       attn_data        = dst;
@@ -180,6 +184,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
+        bool interleaved,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int device = ggml_cuda_get_device();
@@ -189,9 +194,11 @@ static void launch_gated_delta_net(
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
-    // r = H_v / H_k: each k-head is shared by r v-heads in grouped order
-    const uint3 rq1_magic = init_fastdiv_values(H / neqk1);
-    const uint3 rq3_magic = init_fastdiv_values(rq3);
+    // tiled:    v-head h pairs with k-head h % H_k          (ggml_repeat broadcast order)
+    // grouped:  v-head h pairs with k-head h / r, r = H/H_k (mx.repeat / repeat_interleave order)
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq1_magic   = init_fastdiv_values(H / neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
@@ -199,26 +206,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, state_slot_stride, K);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, state_slot_stride, K);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, state_slot_stride, K);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, state_slot_stride, K);
             break;
         }
         default:
@@ -291,7 +298,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     cudaStream_t stream = ctx.stream();
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
-    const int K = ggml_get_op_params_i32(dst, 0);
+    const int  K            = ggml_get_op_params_i32(dst, 0);
+    // op param 1: q/k broadcast pairing (see ggml_gated_delta_net_set_bcast); default tiled
+    const bool interleaved  = ggml_get_op_params_i32(dst, 1) != 0;
     const bool keep_rs = K > 1;
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
@@ -306,21 +315,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, interleaved, scale, state_slot_stride, K, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, interleaved, scale, state_slot_stride, K, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, interleaved, scale, state_slot_stride, K, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, interleaved, scale, state_slot_stride, K, stream);
         }
     }
 }

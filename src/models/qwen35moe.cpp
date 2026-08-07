@@ -15,6 +15,12 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
+    // V-head order: MLX/u32-derived Qwen3.5-MoE GGUFs keep the grouped layout
+    // (v-head h pairs with k-head h / r), so default to grouped unless the key
+    // says the checkpoint was converted with the tiled V-head reorder.
+    hparams.ssm_v_heads_tiled = false;
+    ml.get_key(LLM_KV_SSM_V_HEADS_TILED, hparams.ssm_v_heads_tiled, false);
+
     // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
@@ -461,30 +467,35 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // if head keys and value keys are different, expand to force tensors into
-    // matching shapes. The model pairs v-head h with k-head h // r (MLX uses
-    // mx.repeat = grouped order); ggml_repeat_4d would produce the tiled order
-    // [k0..k{Hk-1}, k0..k{Hk-1}] which scrambles every head with h != h // r,
-    // so build the grouped expansion by concatenating per-head duplicates.
+    // matching shapes. The checkpoint convention is given by ssm_v_heads_tiled:
+    // grouped (MLX/u32 checkpoints pair v-head h with k-head h // r, mx.repeat
+    // order) concatenates each k-head r times; tiled (convert script reorders
+    // V heads) uses ggml_repeat_4d.
     // note: needed only if we are not using the fused GDN.
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        const int64_t r = num_v_heads / num_k_heads;
-        ggml_tensor * q_rep = nullptr;
-        ggml_tensor * k_rep = nullptr;
-        for (int64_t h = 0; h < num_k_heads; ++h) {
-            ggml_tensor * qh = ggml_view_4d(ctx0, q_conv, head_k_dim, 1, n_seq_tokens, n_seqs,
-                    q_conv->nb[1], q_conv->nb[2], q_conv->nb[3],
-                    h * head_k_dim * ggml_element_size(q_conv));
-            ggml_tensor * kh = ggml_view_4d(ctx0, k_conv, head_k_dim, 1, n_seq_tokens, n_seqs,
-                    k_conv->nb[1], k_conv->nb[2], k_conv->nb[3],
-                    h * head_k_dim * ggml_element_size(k_conv));
-            for (int64_t c = 0; c < r; ++c) {
-                q_rep = q_rep ? ggml_concat(ctx0, q_rep, qh, 1) : qh;
-                k_rep = k_rep ? ggml_concat(ctx0, k_rep, kh, 1) : kh;
+        if (!hparams.ssm_v_heads_tiled) {
+            const int64_t r = num_v_heads / num_k_heads;
+            ggml_tensor * q_rep = nullptr;
+            ggml_tensor * k_rep = nullptr;
+            for (int64_t h = 0; h < num_k_heads; ++h) {
+                ggml_tensor * qh = ggml_view_4d(ctx0, q_conv, head_k_dim, 1, n_seq_tokens, n_seqs,
+                        q_conv->nb[1], q_conv->nb[2], q_conv->nb[3],
+                        h * head_k_dim * ggml_element_size(q_conv));
+                ggml_tensor * kh = ggml_view_4d(ctx0, k_conv, head_k_dim, 1, n_seq_tokens, n_seqs,
+                        k_conv->nb[1], k_conv->nb[2], k_conv->nb[3],
+                        h * head_k_dim * ggml_element_size(k_conv));
+                for (int64_t c = 0; c < r; ++c) {
+                    q_rep = q_rep ? ggml_concat(ctx0, q_rep, qh, 1) : qh;
+                    k_rep = k_rep ? ggml_concat(ctx0, k_rep, kh, 1) : kh;
+                }
             }
+            q_conv = q_rep;
+            k_conv = k_rep;
+        } else {
+            q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+            k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         }
-        q_conv = q_rep;
-        k_conv = k_rep;
     }
 
     cb(q_conv, "q_conv_predelta", il);
