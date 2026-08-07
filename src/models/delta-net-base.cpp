@@ -100,12 +100,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         g_cs_j = ggml_repeat_4d(ctx0, g_cs_j, CS, CS, S_k, CHB);  // [1, chunk_size, S_k, CHB] -> [chunk_size, chunk_size, S_k, CHB]
 
         // decay_mask [chunk_size,chunk_size,S_k,CHB]
-        // sub yields g_cs[j] - g_cs[i]; the decay from time j to i (i >= j) is
-        // exp(g_cs[i] - g_cs[j]) (g_cs is the cumsum of the negative log-decay),
-        // so negate the subtraction.
+        // entry (i, j) = exp(g_cs[j] - g_cs[i]); tri LOWER_DIAG keeps i <= j,
+        // and g_cs is the cumsum of the (<= 0) log-decay, so for i <= j this is
+        // exp(-sum_{t=i+1..j} logdecay_t) in (0, 1] -- the decay between
+        // positions i and j. (Do NOT negate: that would turn it into growth.)
         ggml_tensor * decay_mask;
         decay_mask = ggml_sub(ctx0, g_cs_j, g_cs_i);
-        decay_mask = ggml_neg(ctx0, decay_mask);
         decay_mask = ggml_tri(ctx0, decay_mask, GGML_TRI_TYPE_LOWER_DIAG);
         decay_mask = ggml_exp(ctx0, decay_mask);
         cb(decay_mask, "decay_mask", il);
@@ -133,12 +133,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         g_cs_j = ggml_repeat_4d(ctx0, g_cs_j, CS, CS, n_chunks, H_v * n_seqs);
 
         // [CS, CS, n_chunks, H_v * n_seqs]
-        // sub yields g_cs[j] - g_cs[i]; the decay from time j to i (i >= j) is
-        // exp(g_cs[i] - g_cs[j]) (g_cs is the cumsum of the negative log-decay),
-        // so negate the subtraction.
+        // entry (i, j) = exp(g_cs[j] - g_cs[i]); tri LOWER_DIAG keeps i <= j,
+        // and g_cs is the cumsum of the (<= 0) log-decay, so for i <= j this is
+        // exp(-sum_{t=i+1..j} logdecay_t) in (0, 1] -- the decay between
+        // positions i and j. (Do NOT negate: that would turn it into growth.)
         ggml_tensor * decay_mask;
         decay_mask = ggml_sub(ctx0, g_cs_j, g_cs_i);
-        decay_mask = ggml_neg(ctx0, decay_mask);
         decay_mask = ggml_tri(ctx0, decay_mask, GGML_TRI_TYPE_LOWER_DIAG);
         decay_mask = ggml_exp(ctx0, decay_mask);
         cb(decay_mask, "decay_mask", il);
