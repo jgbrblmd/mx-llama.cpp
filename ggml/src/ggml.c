@@ -6377,6 +6377,14 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_set_bcast(
+        struct ggml_tensor  * gated_delta_net,
+        bool                  interleaved) {
+    GGML_ASSERT(gated_delta_net->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(gated_delta_net, 1, interleaved ? 1 : 0);
+    return gated_delta_net;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
