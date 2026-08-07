@@ -91,13 +91,18 @@ class Qwen2MoeModel(TextModel):
         # PyTorch (A,B,C) -> GGUF writes [C,B,A] -> GGML reads ne={C,B,A}
         # Input shapes from HF: (n_expert, n_ff_exp, n_embd) or (n_expert, n_embd, n_ff_exp)
         # Expected GGML ne: {n_embd, n_ff_exp, n_expert} for gate/up, {n_ff_exp, n_embd, n_expert} for down
-        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
-            mapped = f"{name}.weight" if not name.endswith(".weight") else name
+        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight") or name.endswith("mlp.switch_mlp.down_proj") or name.endswith("mlp.switch_mlp.down_proj.weight"):
+            # Map switch_mlp to experts for tensor name mapping
+            mapped = name.replace("switch_mlp", "experts")
+            if not mapped.endswith(".weight"):
+                mapped = f"{mapped}.weight"
             # HF: [n_expert, n_embd, n_ff] -> GGML: {n_ff, n_embd, n_expert}
             yield from super().modify_tensors(data_torch, mapped, bid)
             return
 
-        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
+        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight") or name.endswith("mlp.switch_mlp.gate_up_proj") or name.endswith("mlp.switch_mlp.gate_up_proj.weight"):
+            # Map switch_mlp to experts for tensor name mapping
+            mapped_name = name.replace("switch_mlp", "experts")
             if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
                 raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
             # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2
@@ -105,19 +110,30 @@ class Qwen2MoeModel(TextModel):
             gate = data_torch[..., :n_ff, :].contiguous()
             up = data_torch[..., n_ff:, :].contiguous()
             # gate/up: [n_expert, n_ff, n_embd] -> GGML: {n_embd, n_ff, n_expert}
-            base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
+            base_name = mapped_name.removesuffix(".weight").removesuffix(".gate_up_proj")
             mapped_gate = f"{base_name}.gate_proj.weight"
             mapped_up = f"{base_name}.up_proj.weight"
             yield from super().modify_tensors(gate, mapped_gate, bid)
             yield from super().modify_tensors(up, mapped_up, bid)
             return
 
-        if name.find("experts") != -1:
+        if name.find("experts") != -1 or name.find("switch_mlp") != -1:
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None
 
             if self._experts is None:
                 self._experts = [{} for _ in range(self.block_count)]
+
+            # For switch_mlp (per-expert 3D tensor, no expert_id in name), pass through
+            if name.find("switch_mlp") != -1:
+                mapped = name.replace("switch_mlp", "experts")
+                if not mapped.endswith(".weight"):
+                    mapped = f"{mapped}.weight"
+                # 3D per-expert tensors are written as-is: GGUF reverses torch dims,
+                # which yields exactly the GGML ne layout llama.cpp expects for
+                # QWEN35MOE experts ({n_ff, n_embd, n_expert}).
+                yield from super().modify_tensors(data_torch, mapped, bid)
+                return
 
             self._experts[bid][name] = data_torch
 
@@ -286,6 +302,9 @@ class _QwenMtpMixin:
     mtp_only: bool
     _original_block_count: int | None = None
     opt_num_mtp_layers: int = 0
+    # Qwen3-Next stores norm weights offset by +1 (llama.cpp subtracts it back);
+    # Qwen3.5 does not, so subclasses must clear this.
+    _apply_norm_offset = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -294,8 +313,10 @@ class _QwenMtpMixin:
             n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
             # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
             if n_mtp == 0:
-                assert self.opt_num_mtp_layers != 0
-                n_mtp = self.opt_num_mtp_layers
+                if self.opt_num_mtp_layers != 0:
+                    n_mtp = self.opt_num_mtp_layers
+                else:
+                    n_mtp = 0
             self.block_count += n_mtp
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -378,13 +399,18 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25)))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip QKVZ reordering for U32 compressed quantization
+        if data_torch.dtype == torch.uint32 and "in_proj_qkvz" in name:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
         if name.endswith(".A_log"):
             data_torch = -torch.exp(data_torch)
         elif name.endswith(".dt_bias"):
             name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
         elif "conv1d" in name:
             data_torch = data_torch.squeeze()
-        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight") and self._apply_norm_offset:
             data_torch = data_torch + 1
 
         if "in_proj_qkvz.weight" in name:
@@ -555,6 +581,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
 
+        # Skip V head reordering for U32 compressed quantization (will be handled at load time)
+        if data_torch.dtype == torch.uint32:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
         if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
             head_k_dim = self.hparams["linear_key_head_dim"]
             head_v_dim = self.hparams["linear_value_head_dim"]
@@ -622,11 +653,23 @@ class _Qwen35MRopeMixin:
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
+    _apply_norm_offset = False
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
 class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
+    _apply_norm_offset = False
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip quantization biases and scales - not supported in GGUF format
+        if name.endswith(".biases") or name.endswith(".scales"):
+            return
+        # Qwen3.5 HF/MLX layout is already tile-per-head flat ([q;k;v] in row
+        # order), matching llama.cpp's qwen35moe loader. The V-head reordering
+        # in _LinearAttentionVReorderBase assumes the older Qwen3-Next
+        # interleaved layout and must NOT be applied here.
+        yield from Qwen3NextModel.modify_tensors(self, data_torch, name, bid)
 
 
 @ModelBase.register("DFlashDraftModel")

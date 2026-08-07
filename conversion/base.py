@@ -313,7 +313,7 @@ class ModelBase:
         new_tensors: dict[str, Callable[[], Tensor]] = {}
 
         if (quant_config := self.hparams.get("quantization_config")) and isinstance(quant_config, dict):
-            quant_method = quant_config.get("quant_method")
+            quant_method = quant_config.get("quant_method") or quant_config.get("mode")
 
             def dequant_bitnet(weight: Tensor, scale: Tensor) -> Tensor:
                 weight = weight.view(torch.uint8)
@@ -326,6 +326,71 @@ class ModelBase:
 
                 # The scale is inverted
                 return data / scale.float()
+
+            def dequant_u32(weight: Tensor, scale: Tensor, bias: Tensor | None, bits: int) -> Tensor:
+                """Decompress MLX affine U32 packed weights: w = s * q + b.
+
+                8-bit: each uint32 packs 4 little-endian bytes (group_size 32).
+                6-bit: continuous bitstream, 32/6 values per uint32 (group_size 64).
+                """
+                was_3d = weight.ndim == 3
+                # 3D per-expert weights: (n_experts, M, N) packed u32
+                if was_3d:
+                    E3, M3, N3 = weight.shape
+                    weight = weight.reshape(E3 * M3, N3)
+                    if scale.ndim == 3:
+                        scale = scale.reshape(E3 * M3, scale.shape[-1])
+                    if bias is not None and bias.ndim == 3:
+                        bias = bias.reshape(E3 * M3, bias.shape[-1])
+
+                M, N = weight.shape
+
+                if bits == 8:
+                    # uint32 view as uint8 gives the LE byte stream: each u32's
+                    # 4 bytes are contiguous in order (b0, b1, b2, b3), which is
+                    # exactly the MLX affine layout. (Do NOT permute: a permute
+                    # view would reorder to byte-planes.)
+                    q = weight.view(torch.uint8).reshape(M, N * 4)
+                    n_val = N * 4
+                elif bits == 6:
+                    # continuous 6-bit bitstream over the uint32 array
+                    # (6-bit packing crosses uint32 word boundaries)
+                    n_val = N * 32 // 6
+                    pos = torch.arange(n_val, dtype=torch.int64) * 6
+                    u32_idx = pos // 32
+                    bit_off = pos % 32
+                    # eager numpy: torch CPU lacks uint64 shifts, and this
+                    # path needs data-dependent bit ops that don't work on meta
+                    import numpy as np
+                    we = LazyTorchTensor.to_eager(weight)
+                    wn = we.view(torch.int32).numpy().astype(np.uint32, copy=False)
+                    w64 = wn.astype(np.uint64)                       # {M, N}
+                    ui = u32_idx.numpy()
+                    bo64 = bit_off.numpy().astype(np.uint64)
+                    boi = bit_off.numpy()
+                    lo = (w64[:, ui] >> bo64[None, :])               # low bits (may be partial)
+                    n_more = np.clip(6 - (32 - boi), 0, 6).astype(np.uint64)  # > 0 => crosses word
+                    mask = (np.uint64(1) << n_more) - 1
+                    hi = (w64[:, np.clip(ui + 1, 0, N - 1)] & mask) << np.clip(32 - boi, 0, 31).astype(np.uint64)
+                    qn = (lo | hi) & 0x3F
+                    q = torch.from_numpy(qn.astype(np.float32))
+                    # the 6-bit path is eager; make scale/bias eager too
+                    scale = LazyTorchTensor.to_eager(scale)
+                    if bias is not None:
+                        bias = LazyTorchTensor.to_eager(bias)
+                else:
+                    raise ValueError(f"Unsupported bits={bits} for MLX affine dequant")
+
+                q = q.to(torch.bfloat16)
+                group = n_val // scale.shape[-1]  # values per scale group
+                # scale/bias {M, G} -> {M, n_val}
+                scale = scale.repeat_interleave(group, dim=-1)
+                result = q * scale
+                if bias is not None:
+                    result = result + bias.repeat_interleave(group, dim=-1)
+                if was_3d:
+                    result = result.reshape(E3, M3, -1)
+                return result
 
             def dequant_simple(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
                 scale = scale.float()
@@ -454,6 +519,38 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith(".qscale_act"):
                         tensors_to_remove.append(name)
+            elif quant_method == "affine":
+                # per-tensor bits override (config has per-tensor entries like
+                # "language_model.model.layers.0.linear_attn.in_proj_qkv": {bits: 6})
+                # NOTE: model_tensors keys have the "language_model." prefix stripped
+                # by filter_tensors, so try both forms.
+                def bits_for(name: str) -> int:
+                    key = name.removesuffix(".weight")
+                    for cand in (key, "language_model." + key, key.removeprefix("language_model.")):
+                        cfg = quant_config.get(cand)
+                        if isinstance(cfg, dict) and cfg.get("bits"):
+                            return cfg["bits"]
+                    return int(quant_config.get("bits", 8))
+
+                for name in self.model_tensors.keys():
+                    if name.endswith(".weight"):
+                        # only 2D/3D weights are packed as uint32
+                        if len(self.model_tensors[name]().shape) not in (2, 3):
+                            continue
+                        scale_name = name + "_scale"
+                        scales_name = name.replace(".weight", ".scales")
+                        biases_name = name.replace(".weight", ".biases")
+                        if scale_name not in self.model_tensors and scales_name not in self.model_tensors:
+                            continue
+                        w = self.model_tensors[name]
+                        s = self.model_tensors.get(scale_name) or self.model_tensors.get(scales_name)
+                        b = self.model_tensors.get(biases_name)
+                        bits = bits_for(name)
+                        self.model_tensors[name] = lambda w=w, s=s, b=b, bits=bits: dequant_u32(w(), s(), b() if b is not None else None, bits)
+                        to_remove = [scale_name if scale_name in self.model_tensors else scales_name]
+                        if biases_name in self.model_tensors:
+                            to_remove.append(biases_name)
+                        tensors_to_remove += to_remove
             elif quant_method == "gptq":
                 for name in self.model_tensors.keys():
                     if name.endswith(".qweight"):
@@ -2513,7 +2610,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.int64: np.int64,
         # torch.uint64: np.uint64,
         torch.int32: np.int32,
-        # torch.uint32: np.uint32,
+        torch.uint32: np.uint32,
         torch.int16: np.int16,
         # torch.uint16: np.uint16,
         torch.int8: np.int8,
@@ -2533,7 +2630,7 @@ class LazyTorchTensor(gguf.LazyBase):
         "F16": torch.float16,
         # "U64": torch.uint64,
         "I64": torch.int64,
-        # "U32": torch.uint32,
+        "U32": torch.uint32,
         "I32": torch.int32,
         # "U16": torch.uint16,
         "I16": torch.int16,
