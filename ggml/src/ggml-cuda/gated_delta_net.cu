@@ -23,7 +23,7 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb1,
                                      int64_t       sb2,
                                      int64_t       sb3,
-                                     const uint3   neqk1_magic,
+                                     const uint3   rq1_magic,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
@@ -34,7 +34,11 @@ gated_delta_net_cuda(const float * q,
     const int      lane     = threadIdx.x;
     const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
 
-    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    // v-head h_idx pairs with k-head h_idx / r (r = H_v / H_k): the model
+    // expands q/k in grouped order (MLX mx.repeat; the CPU path concatenates
+    // each k-head r times). h_idx % H_k would be the tiled order, which
+    // scrambles every head with h % H_k != h / r when H_v != H_k.
+    const uint32_t iq1 = fastdiv(h_idx, rq1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     float *       attn_data        = dst;
@@ -185,8 +189,9 @@ static void launch_gated_delta_net(
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
-    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
-    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+    // r = H_v / H_k: each k-head is shared by r v-heads in grouped order
+    const uint3 rq1_magic = init_fastdiv_values(H / neqk1);
+    const uint3 rq3_magic = init_fastdiv_values(rq3);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
@@ -194,26 +199,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, rq1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         default:
@@ -247,6 +252,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const bool kda = (src_g->ne[0] == S_v);
 
     GGML_ASSERT(neq1 == nek1);
+    GGML_ASSERT(nev1 % neq1 == 0);
     const int64_t neqk1 = neq1;
 
     const int64_t rq3 = nev3 / neq3;
