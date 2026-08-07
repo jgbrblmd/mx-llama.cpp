@@ -241,6 +241,7 @@ class Keys:
         STATE_SIZE     = "{arch}.ssm.state_size"
         TIME_STEP_RANK = "{arch}.ssm.time_step_rank"
         GROUP_COUNT    = "{arch}.ssm.group_count"
+        V_HEADS_TILED  = "{arch}.ssm.v_heads_tiled"
         DT_B_C_RMS     = "{arch}.ssm.dt_b_c_rms"
 
     class KDA:
