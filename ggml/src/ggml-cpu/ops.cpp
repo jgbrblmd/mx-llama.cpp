@@ -10846,8 +10846,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float * state_in_base = (const float *)src_state->data;
 
-  //const int64_t rq1 = nev1 / neq1;
-  //const int64_t rk1 = nev1 / nek1;
+    // q/k may be passed unexpanded (fused path, H_k heads) or expanded to H_v
+    // heads (non-fused path). In the expanded case neq1 == nev1 and both index
+    // forms collapse to the identity, so the pairing comes from the expansion.
+    // In the unexpanded case the pairing convention comes from op param 1
+    // (see ggml_gated_delta_net_set_bcast): tiled -> h % H_k, grouped -> h / r.
+    const bool interleaved = ggml_get_op_params_i32(dst, 1) != 0;
+    const int64_t rq1 = nev1 / neq1;
     const int64_t rq3 = nev3 / neq3;
     const int64_t rk3 = nev3 / nek3;
 
@@ -10857,7 +10862,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
 
-        const int64_t iq1 = iv1 % neq1;
+        const int64_t iq1 = interleaved ? (iv1 / rq1) : (iv1 % neq1);
         const int64_t ik1 = iv1 % nek1;
 
         const int64_t iq3 = iv3 / rq3;

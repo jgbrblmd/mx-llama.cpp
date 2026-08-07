@@ -407,7 +407,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+    // q/k are passed unexpanded (H_k heads): the fused kernel must know the
+    // checkpoint's v-head pairing convention (tiled vs grouped, see
+    // ggml_gated_delta_net_set_bcast).
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_gated_delta_net_set_bcast(result, !hparams.ssm_v_heads_tiled);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -573,7 +577,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+    // q/k may be unexpanded here (fused path): convey the v-head pairing convention.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_gated_delta_net_set_bcast(gdn_out, !hparams.ssm_v_heads_tiled);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
