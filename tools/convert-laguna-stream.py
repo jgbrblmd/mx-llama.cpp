@@ -20,7 +20,8 @@ ROCmFP4 block, or 1D convention):
   - attn_gate (48/72 heads -> rows of 48/72, ggml_row_size asserts 32-alignment) -> F32
   - ffn_gate_inp (router, reference keeps F32 to protect top-k selection) -> F32
 
-Usage: python convert-laguna-stream.py <src-gguf> <src-dir> <out-gguf>
+Usage: python convert-laguna-stream.py <shell-gguf> <src-dir> <out-gguf>
+<shell-gguf> is a metadata-only GGUF from make-laguna-shell.py (no tensors)
 """
 
 import re
@@ -53,6 +54,10 @@ for key, f in r.fields.items():
         continue  # header fields, not real kv
     t = f.types
     vtype = t[0]
+    if key == 'general.file_type':
+        # tensors are ROCmFP4 now
+        w.add_key_value(key, 100, vtype)  # GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4
+        continue
     if key == 'laguna.attention.head_count':
         # already an array in the source; re-emit defensively (element type INT32)
         w.add_key_value(key, [layer_heads(i) for i in range(N_LAYER)],
@@ -79,29 +84,29 @@ SHARDS = sorted(SRC_DIR.glob('model-*.safetensors'))
 
 def gguf_name(key):
     if key == 'model.embed_tokens.weight':
-        return 'token_embd.weight', True
+        return 'token_embd.weight'
     if key == 'lm_head.weight':
-        return 'output.weight', True
+        return 'output.weight'
     if key == 'model.norm.weight':
-        return 'output_norm.weight', False
+        return 'output_norm.weight'
     il = int(re.match(r'^model\.layers\.(\d+)\.', key).group(1))
     if 'shared_expert' in key:
         kind = re.search(r'\.(gate|up|down)_proj\.weight$', key).group(1)
-        return f'blk.{il}.ffn_{kind}_shexp.weight', True
+        return f'blk.{il}.ffn_{kind}_shexp.weight'
     kind = RE_KIND.search(key).group(1)
-    if kind == 'input_layernorm':    return f'blk.{il}.attn_norm.weight', False
-    if kind == 'post_attention_layernorm': return f'blk.{il}.ffn_norm.weight', False
-    if kind == 'q_proj':             return f'blk.{il}.attn_q.weight', True
-    if kind == 'k_proj':             return f'blk.{il}.attn_k.weight', True
-    if kind == 'v_proj':             return f'blk.{il}.attn_v.weight', True
-    if kind == 'o_proj':             return f'blk.{il}.attn_output.weight', True
-    if kind == 'q_norm':             return f'blk.{il}.attn_q_norm.weight', False
-    if kind == 'k_norm':             return f'blk.{il}.attn_k_norm.weight', False
-    if kind == 'g_proj':             return f'blk.{il}.attn_gate.weight', True
-    if kind == 'gate':               return f'blk.{il}.ffn_gate_inp.weight', True
-    if kind == 'gate_proj':          return f'blk.{il}.ffn_gate.weight', True
-    if kind == 'up_proj':            return f'blk.{il}.ffn_up.weight', True
-    if kind == 'down_proj':          return f'blk.{il}.ffn_down.weight', True
+    if kind == 'input_layernorm':    return f'blk.{il}.attn_norm.weight'
+    if kind == 'post_attention_layernorm': return f'blk.{il}.ffn_norm.weight'
+    if kind == 'q_proj':             return f'blk.{il}.attn_q.weight'
+    if kind == 'k_proj':             return f'blk.{il}.attn_k.weight'
+    if kind == 'v_proj':             return f'blk.{il}.attn_v.weight'
+    if kind == 'o_proj':             return f'blk.{il}.attn_output.weight'
+    if kind == 'q_norm':             return f'blk.{il}.attn_q_norm.weight'
+    if kind == 'k_norm':             return f'blk.{il}.attn_k_norm.weight'
+    if kind == 'g_proj':             return f'blk.{il}.attn_gate.weight'
+    if kind == 'gate':               return f'blk.{il}.ffn_gate_inp.weight'
+    if kind == 'gate_proj':          return f'blk.{il}.ffn_gate.weight'
+    if kind == 'up_proj':            return f'blk.{il}.ffn_up.weight'
+    if kind == 'down_proj':          return f'blk.{il}.ffn_down.weight'
     raise KeyError(kind)
 
 # collect tensor shapes from safetensors metadata (no data)
@@ -117,7 +122,10 @@ for shard in SHARDS:
                 il, e, kind = int(m.group(1)), int(m.group(2)), m.group(3)
                 out = f'blk.{il}.ffn_{"down" if kind == "down_proj" else ("gate" if kind == "gate_proj" else "up")}_exps.weight'
                 if out not in tensors:
-                    tensors[out] = [[shp[1], shp[0], N_EXPERT], str(shard), key]
+                    # numpy shape (n_expert, n_ff, n_embd); GGUFWriter reverses
+                    # to on-disk dims (n_embd, n_ff, n_expert) == llama.cpp's
+                    # create_tensor order
+                    tensors[out] = [[N_EXPERT, shp[0], shp[1]], str(shard), key]
                 exp_keys.setdefault((il, kind), []).append((str(shard), key))
                 continue
             if RE_BIAS.match(key):
@@ -125,8 +133,10 @@ for shard in SHARDS:
                 tensors[f'blk.{il}.exp_probs_b.bias'] = [list(shp), str(shard), key]
                 continue
             if RE_FLAT.match(key):
-                name, tr = gguf_name(key)
-                tensors[name] = [list(shp[::-1]) if tr else list(shp), str(shard), key]
+                # HF safetensors layout == GGUF numpy layout (row-major, last
+                # dim fastest); the writer emits on-disk dims reversed, which
+                # is what llama.cpp's create_tensor expects. No transpose.
+                tensors[gguf_name(key)] = [list(shp), str(shard), key]
                 continue
             raise KeyError(f'unmapped {key}')
     print(f'  pass1 {shard.name}: {len(tensors)} tensors')
@@ -182,15 +192,11 @@ for name in order:
         del t
     elif tensor_is_f32(name, shape):
         t = open_shards[shard].get_slice(key)[:]
-        if tuple(t.shape) != tuple(shape):
-            t = t.T
         assert t.shape == tuple(shape), f'{name}: {t.shape} vs {shape}'
         q = t.contiguous().to(torch.float32)
         del t
     else:
         t = open_shards[shard].get_slice(key)[:]
-        if tuple(t.shape) != tuple(shape):
-            t = t.T
         assert t.shape == tuple(shape), f'{name}: {t.shape} vs {shape}'
         q = quantize_rocmfp4(t.contiguous().to(torch.float32))
         del t
@@ -199,10 +205,10 @@ for name in order:
     written += 1
     if written % 100 == 0:
         print(f'  {written}/{len(order)} tensors written')
-for f in open_shards.values():
-    f.close()
 
 assert written == len(order), f'{written} != {len(order)}'
+# note: safetensors' safe_open (Rust builtin since 0.8.0) has no close();
+# handles are released at process exit
 w.close()
 import os
 print(f'done: {OUT} ({os.path.getsize(OUT)/1e9:.2f} GB, {written} tensors)')
