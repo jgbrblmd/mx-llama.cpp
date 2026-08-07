@@ -1115,6 +1115,9 @@ class GGUFWriter:
     def add_ssm_group_count(self, value: int) -> None:
         self.add_uint32(Keys.SSM.GROUP_COUNT.format(arch=self.arch), value)
 
+    def add_ssm_v_heads_tiled(self, value: bool) -> None:
+        self.add_bool(Keys.SSM.V_HEADS_TILED.format(arch=self.arch), value)
+
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
 

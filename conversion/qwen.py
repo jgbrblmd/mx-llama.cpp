@@ -473,14 +473,17 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT  # overridden by subclasses
     """reorders V heads from grouped to tiled order for ggml broadcast
 
-    see https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
-
-    Linear attention may has num_k_heads < num_v_heads. The HF weights store
-    V heads grouped by K head: [G0_v0..v{r-1}, G1_v0..v{r-1}, ...].
-    ggml binary ops use tiled broadcast: [K0, K1, ..., K0, K1, ...].
-    We reorder V heads to tiled order so ggml_repeat can replace the expensive
-    interleaved repeat: [G0_v0, G1_v0, ..., G0_v1, G1_v1, ...].
+    The runtime (fused GDN) needs to know the pairing convention the checkpoint
+    was converted with: this repo's pipeline reorders V heads to tiled order,
+    while MLX affine (u32) checkpoints keep the grouped layout as-is. The flag
+    is written into the GGUF as <arch>.ssm.v_heads_tiled.
     """
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        qc = self.hparams.get("quantization_config")
+        is_mlx_affine = isinstance(qc, dict) and ((qc.get("quant_method") or qc.get("mode")) == "affine")
+        self.gguf_writer.add_ssm_v_heads_tiled(not is_mlx_affine)
 
     @staticmethod
     def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
@@ -662,14 +665,20 @@ class _Qwen35MRopeMixin:
 @ModelBase.example("Qwen/Qwen3.5-9B")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
-    _apply_norm_offset = False
+    # Qwen3.5 RMSNorm is 1-centered (transformers computes (1 + w)), and the
+    # llama.cpp qwen35 runtime applies plain RMS on the GGUF weights, so the
+    # +1 must be baked in at conversion. linear_attn.norm (gated norm) is
+    # stored already 1-centered in the checkpoint and stays as-is (excluded
+    # in modify_tensors). NOTE: keep this True -- setting it False writes raw
+    # norm weights and the runtime output degenerates into token-echo loops.
+    _apply_norm_offset = True
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
 @ModelBase.example("Qwen/Qwen3.5-35B-A3B")
 class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
-    _apply_norm_offset = False
+    _apply_norm_offset = True
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Skip quantization biases and scales - not supported in GGUF format
