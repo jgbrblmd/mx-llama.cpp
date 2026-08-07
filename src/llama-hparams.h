@@ -173,6 +173,11 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
+    // true: the checkpoint's V heads are in tiled order (v-head h pairs with
+    // k-head h % H_k, this repo's convert script reorders V heads to tiled
+    // order). false: grouped/interleaved (v-head h pairs with k-head h / r,
+    // MLX/u32 checkpoints keep the layout as-is).
+    bool ssm_v_heads_tiled = true;
 
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;

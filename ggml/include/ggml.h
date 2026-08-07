@@ -2610,6 +2610,18 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // configure how v-head h pairs with the (q,k) head when H_v > H_k and the
+    // q/k tensors are passed unexpanded (fused path). The checkpoint convention
+    // is fixed at conversion time (this repo's convert script reorders V heads
+    // to tiled order; MLX/u32 checkpoints keep the grouped/interleaved layout):
+    //   interleaved == false -> tiled:      iq1 = h % H_k   (ggml_repeat broadcast order)
+    //   interleaved == true  -> grouped:    iq1 = h / r     (mx.repeat / repeat_interleave order)
+    // Ignored by the CPU op (it reads q/k expanded, so the pairing comes from
+    // the expansion itself). Defaults to tiled when not called.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_set_bcast(
+            struct ggml_tensor  * gated_delta_net,
+            bool                  interleaved);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
