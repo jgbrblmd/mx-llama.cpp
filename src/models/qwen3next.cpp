@@ -458,6 +458,9 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
 
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    // reshape creates a view with non-standard strides; make contiguous for GDN op
+    beta = ggml_cont(ctx0, beta);
+    gate = ggml_cont(ctx0, gate);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);

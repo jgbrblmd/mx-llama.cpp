@@ -390,7 +390,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    // reshape creates a view with non-standard strides; make contiguous for GDN op
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    beta = ggml_cont(ctx0, beta);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
@@ -408,6 +410,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    // reshape creates a view with non-standard strides; make contiguous for GDN op
+    gate = ggml_cont(ctx0, gate);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
