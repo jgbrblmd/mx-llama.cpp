@@ -926,6 +926,13 @@ private:
 
     common_params params_base;
 
+    // phase-based scheduling state (--prefill-priority):
+    // true  = a prefill phase is in progress, pending prompts keep joining it
+    //         until none are left, only then does generation start
+    // false = generation phase, no new prompt is prefilled until all slots
+    //         finish generating
+    bool phase_prefill = false;
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -2962,123 +2969,170 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
-        // determine which slots are generating and drafting
+        // phase-based scheduling (--prefill-priority):
+        // prefill and decode never share a batch. pending prompts are prefilled
+        // together (new prompts keep joining the current prefill phase) and only
+        // when all prompts are done does generation start; generation then runs
+        // to completion before the next prefill phase begins.
+        bool has_pending_prompt = false;
+        bool has_active_generation = false;
+
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING) {
-                return;
+            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                has_pending_prompt = true;
             }
-
-            // check if we can batch this slot with the previous one
-            if (!slot_batched) {
-                slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
-            }
-
-            generating.push_back(&slot);
-
-            if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
-
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-                const int n_draft_max = slot.get_n_draft_max();
-
-                if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
-
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
-                        }
-                    } else {
-                        GGML_ASSERT(slot.spec_i_batch.empty());
-
-                        slot.spec_ckpt.update_pos(
-                                slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
-
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
-
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
-
-                        drafting.push_back(&slot);
-                    }
-                }
+            if (slot.state == SLOT_STATE_GENERATING) {
+                has_active_generation = true;
             }
         });
 
-        // generate the actual drafts (if any)
-        {
-            common_speculative_draft(spec.get());
+        bool do_prefill = false;
+        if (params_base.prefill_priority) {
+            if (phase_prefill) {
+                // prefill phase: keep prefill while prompts are pending; a slot
+                // that finished its prompt waits in GENERATING until the phase ends
+                do_prefill = has_pending_prompt;
+                if (!has_pending_prompt) {
+                    phase_prefill = false;
+                }
+            } else if (!has_active_generation) {
+                // all generation done: start a prefill phase if prompts are pending
+                phase_prefill = has_pending_prompt;
+                do_prefill = has_pending_prompt;
+            }
         }
 
-        // make checkpoints if needed
-        iterate(drafting, [&](server_slot & slot) {
-            auto & draft = slot.spec_draft;
-            auto & ckpt  = slot.spec_ckpt;
-
-            slot.n_draft_total += draft.size();
-
-            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-            if (ctx_dft) {
-                if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!do_prefill) {
+            // determine which slots are generating and drafting
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state != SLOT_STATE_GENERATING) {
+                    return;
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                // check if we can batch this slot with the previous one
+                if (!slot_batched) {
+                    slot_batched = &slot;
+                } else if (!slot_batched->can_batch_with(slot)) {
+                    return;
                 }
+
+                generating.push_back(&slot);
+
+                if (spec) {
+                    common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+
+                    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                    const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                    const int n_draft_max = slot.get_n_draft_max();
+
+                    if (n_draft_max > 0) {
+                        GGML_ASSERT(slot.can_speculate());
+
+                        if (!slot.spec_draft.empty()) {
+                            // we have a previous (partial) draft to reuse
+                            if (use_ckpt_tgt) {
+                                GGML_ASSERT(!slot.spec_ckpt.empty());
+                            }
+                        } else {
+                            GGML_ASSERT(slot.spec_i_batch.empty());
+
+                            slot.spec_ckpt.update_pos(
+                                    slot.prompt.n_tokens(),
+                                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                            if (use_ckpt_dft) {
+                                slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+
+                            common_speculative_get_draft_params(spec.get(), slot.id) = {
+                                /* .drafting = */ true,
+                                /* .n_max    = */ n_draft_max,
+                                /* .n_past   = */ slot.prompt.n_tokens(),
+                                /* .id_last  = */ slot.sampled,
+                                /* .prompt   = */ &slot.spec_prompt,
+                                /* .result   = */ &slot.spec_draft,
+                            };
+
+                            drafting.push_back(&slot);
+                        }
+                    }
+                }
+            });
+
+            // generate the actual drafts (if any)
+            {
+                common_speculative_draft(spec.get());
             }
 
-            if (!draft.empty()) {
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+            // make checkpoints if needed
+            iterate(drafting, [&](server_slot & slot) {
+                auto & draft = slot.spec_draft;
+                auto & ckpt  = slot.spec_ckpt;
 
-                const bool use_ckpt_dft =
-                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
+                slot.n_draft_total += draft.size();
 
-                if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (ctx_dft) {
+                    if (use_ckpt_dft) {
+                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-
-                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
-                            (float) ckpt.size() / 1024 / 1024,
-                            (float) ckpt.data_dft.size() / 1024 / 1024);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
                 }
 
-                if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                }
-            }
-        });
+                if (!draft.empty()) {
+                    const bool use_ckpt_tgt =
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                       (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
-        // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
+                    const bool use_ckpt_dft =
+                       (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
+
+                    if (use_ckpt_tgt) {
+                        //const int64_t t_start = ggml_time_us();
+
+                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                        //const int64_t t_total = ggml_time_us() - t_start;
+                        //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+
+                        SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                                (float) ckpt.size() / 1024 / 1024,
+                                (float) ckpt.data_dft.size() / 1024 / 1024);
+                    }
+
+                    if (use_ckpt_dft) {
+                        ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
+                }
+            });
+
+            // update the batch with the sampled/drafted tokens
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+
+        } else {
+            // prefill phase: anchor lora batching checks on the first prompt slot
+            iterate(slots, [&](server_slot & slot) {
+                if (slot_batched) {
+                    return;
+                }
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
+                    return;
+                }
+                slot_batched = &slot;
+            });
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3088,7 +3142,10 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        // note: with --prefill-priority, prompts are batched only during the prefill phase
+        const bool can_batch_prompts = params_base.prefill_priority ? do_prefill : (params_base.cont_batching || batch.size() == 0);
+
+        if (can_batch_prompts) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
