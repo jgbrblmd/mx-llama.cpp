@@ -10,10 +10,6 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,            hparams.n_lora_q, false);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,                  hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                     hparams.n_embd_head_kda);
-    if (!ml.get_key(LLM_KV_KDA_SAFE_GATE, hparams.kda_safe_gate, false)) {
-        hparams.kda_safe_gate = true;
-    }
-    ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,             hparams.kda_gate_lower_bound);
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,       hparams.n_ff_exp);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,              hparams.n_expert_shared);
@@ -24,6 +20,16 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,             hparams.n_layer_nextn, false);
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,           hparams.swiglu_clamp_exp,   hparams.n_layer_all, false);
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,         hparams.swiglu_clamp_shexp, hparams.n_layer_all, false);
+
+    // kda_safe_gate and kda_gate_lower_bound are optional — some converters (e.g. AtomicBot)
+    // omit them; the safe-gate mechanism is baked into the weights themselves, so default true
+    // with a negative lower bound preserves the intended behavior when keys are missing.
+    if (!ml.get_key(LLM_KV_KDA_SAFE_GATE, hparams.kda_safe_gate, false)) {
+        hparams.kda_safe_gate = true;
+    }
+    if (!ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false)) {
+        hparams.kda_gate_lower_bound = -1.0f;
+    }
 
     if (hparams.n_ff_shexp == 0) {
         hparams.n_ff_shexp = hparams.n_ff_exp * std::max(1u, hparams.n_expert_shared);
