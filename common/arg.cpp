@@ -2507,6 +2507,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"-pp", "--prefill-priority"},
+        {},
+        string_format("never mix prefill and decode tokens in the same batch; all pending prompts are prefilled first (in parallel) before any generation, and generation runs to completion before new prompts are prefilled (default: %s)", params.prefill_priority ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prefill_priority = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_PRIORITY"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
