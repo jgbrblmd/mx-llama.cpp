@@ -2979,65 +2979,14 @@ private:
         // when all prompts are done does generation start; generation then runs
         // to completion before the next prefill phase begins.
         bool has_pending_prompt = false;
+        bool has_active_generation = false;
 
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                 has_pending_prompt = true;
             }
-            // check if we can batch this slot with the previous one
-            if (!slot_batched) {
-                slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
-            }
-
-            generating.push_back(&slot);
-
-            if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
-
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-                const int n_draft_max = slot.get_n_draft_max();
-
-                // with the deferred sampling of chunked prefill, a slot can reach
-                // pre_decode before its first token was sampled - no anchor to
-                // draft from yet, skip this iteration
-                if (n_draft_max > 0 && slot.sampled != LLAMA_TOKEN_NULL) {
-                    GGML_ASSERT(slot.can_speculate());
-
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
-                        }
-                    } else {
-                        GGML_ASSERT(slot.spec_i_batch.empty());
-
-                        slot.spec_ckpt.update_pos(
-                                slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
-
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
-
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
-
-                        drafting.push_back(&slot);
-                    }
-                }
+            if (slot.state == SLOT_STATE_GENERATING) {
+                has_active_generation = true;
             }
         });
 
@@ -3050,6 +2999,10 @@ private:
                 if (!has_pending_prompt) {
                     phase_prefill = false;
                 }
+            } else if (!has_active_generation) {
+                // all generation done: start a prefill phase if prompts are pending
+                phase_prefill = has_pending_prompt;
+                do_prefill = has_pending_prompt;
             }
         }
 
@@ -3077,7 +3030,10 @@ private:
 
                     const int n_draft_max = slot.get_n_draft_max();
 
-                    if (n_draft_max > 0) {
+                    // with the deferred sampling of chunked prefill, a slot can reach
+                    // pre_decode before its first token was sampled - no anchor to
+                    // draft from yet, skip this iteration
+                    if (n_draft_max > 0 && slot.sampled != LLAMA_TOKEN_NULL) {
                         GGML_ASSERT(slot.can_speculate());
 
                         if (!slot.spec_draft.empty()) {
