@@ -63,7 +63,9 @@ gated_delta_net_chunked_cuda(
         int64_t       sb2,
         int64_t       sb3,
         const uint3   neqk1_magic,
+        const uint3   rq1_magic,
         const uint3   rq3_magic,
+        bool          interleaved,
         float         scale,
         int           K) {
     const uint32_t h_idx    = blockIdx.x;
@@ -71,7 +73,9 @@ gated_delta_net_chunked_cuda(
     const int      lane     = threadIdx.x;
     const int      warp_id  = threadIdx.y;
 
-    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    // same v-head -> (q,k)-head pairing convention as the non-chunked kernel:
+    // tiled (fork conversion) = h % H_k, grouped (MLX/u32 checkpoints) = h / r
+    const uint32_t iq1 = interleaved ? fastdiv(h_idx, rq1_magic) : fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     float *       state_out = state;
@@ -221,6 +225,7 @@ void launch_gated_delta_net_chunk(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
+        bool interleaved,
         float scale, int K, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
@@ -230,6 +235,7 @@ void launch_gated_delta_net_chunk(
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq1_magic   = init_fastdiv_values(H / neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     switch (S_v) {
@@ -240,7 +246,7 @@ void launch_gated_delta_net_chunk(
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<16, KDA, KDA ? 16 : 64, Tc>, lp,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, K);
             break;
         }
         case 32: {
@@ -250,7 +256,7 @@ void launch_gated_delta_net_chunk(
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<32, KDA, KDA ? 16 : 64, Tc>, lp,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, K);
             break;
         }
         case 64: {
@@ -260,7 +266,7 @@ void launch_gated_delta_net_chunk(
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<64, KDA, KDA ? 16 : 64, Tc>, lp,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, K);
             break;
         }
         case 128: {
@@ -270,7 +276,7 @@ void launch_gated_delta_net_chunk(
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<128, KDA, KDA ? 16 : 64, Tc>, lp,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                sb1, sb2, sb3, neqk1_magic, rq1_magic, rq3_magic, interleaved, scale, K);
             break;
         }
         default:
@@ -289,6 +295,7 @@ template void launch_gated_delta_net_chunk<true, false>(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
+        bool interleaved,
         float scale, int K, cudaStream_t stream);
 template void launch_gated_delta_net_chunk<false, false>(
         const float * q_d, const float * k_d, const float * v_d,
@@ -299,5 +306,6 @@ template void launch_gated_delta_net_chunk<false, false>(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
+        bool interleaved,
         float scale, int K, cudaStream_t stream);
 
