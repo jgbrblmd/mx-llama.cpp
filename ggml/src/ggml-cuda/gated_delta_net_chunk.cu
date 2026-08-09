@@ -3,50 +3,22 @@
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
 
-#define GDN_GCN_DPP_ADD(name, barrier, dpp_ctrl)                                \
-    static __device__ __forceinline__ float name(const float x) {               \
-        float r;                                                                \
-        asm volatile(                                                           \
-            barrier                                                             \
-            "v_add_f32_dpp %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf"  \
-            : "=v"(r) : "v"(x) : "memory");                                     \
-        return r;                                                               \
-    }
-
-GDN_GCN_DPP_ADD(gdn_dpp_add_xor1, "s_nop 4\n", "quad_perm:[1,0,3,2]")
-GDN_GCN_DPP_ADD(gdn_dpp_add_xor2, "s_nop 1\n", "quad_perm:[2,3,0,1]")
-GDN_GCN_DPP_ADD(gdn_dpp_add_xor8, "s_nop 1\n", "row_ror:8")
-
-#undef GDN_GCN_DPP_ADD
-
-static __device__ __forceinline__ float gdn_dpp_xfer_xor4(const float x) {
-    int d;
-    asm volatile("v_mov_b32 %0, %1\n"
-                 "s_nop 1\n"
-                 "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
-                 "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
-                 : "=v"(d) : "v"(__float_as_int(x)) : "memory");
-    return __int_as_float(d);
-}
-
-static __device__ __forceinline__ float gdn_dpp_xfer_xor16(const float x) {
-    int d;
-    asm volatile("ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
-                 "s_waitcnt lgkmcnt(0)\n"
-                 : "=v"(d) : "v"(__float_as_int(x)) : "memory");
-    return __int_as_float(d);
-}
+// gfx906 DPP reduce: the row_ror:8 / ds_swizzle sequence is broken for XOR
+// reduces - XOR8 needs lane i to read lane i^8, but row_ror:8 delivers
+// (i+8) mod 32, which is wrong for half the lanes (8-15, 24-31, ...), and
+// the XOR8 lane groups (by bit 3) cannot be selected with a 4-bit bank_mask
+// (which groups by bit 2). Result: corrupted attention for every chunked
+// prefill on gfx906 -> degenerate output. Fall back to the standard shfl
+// reduce used by the non-chunked kernel (verified correct on gfx906).
 
 template <int width>
 static __device__ __forceinline__ float gdn_warp_reduce_sum(const float x) {
     static_assert(width >= 1 && (width & (width - 1)) == 0, "width must be a power of 2");
     float r = x;
-    if constexpr (width >=  2) { r = gdn_dpp_add_xor1(r); }
-    if constexpr (width >=  4) { r = gdn_dpp_add_xor2(r); }
-    if constexpr (width >=  8) { r += gdn_dpp_xfer_xor4(r); }
-    if constexpr (width >= 16) { r = gdn_dpp_add_xor8(r); }
-    if constexpr (width >= 32) { r += gdn_dpp_xfer_xor16(r); }
-    if constexpr (width >= 64) { r += __shfl_xor_sync(0xffffffff, r, 32, 64); }
+    #pragma unroll
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        r += __shfl_xor_sync(0xffffffff, r, offset, width);
+    }
     return r;
 }
 
