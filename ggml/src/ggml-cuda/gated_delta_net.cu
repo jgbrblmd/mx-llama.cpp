@@ -195,7 +195,7 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
                 sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1, rq3, scale, K, stream);
+                neqk1, rq3, interleaved, scale, K, stream);
             return;
         }
     } 

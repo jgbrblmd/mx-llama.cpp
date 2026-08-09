@@ -13,4 +13,5 @@ void launch_gated_delta_net_chunk(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
+        bool interleaved,
         float scale, int K, cudaStream_t stream);
