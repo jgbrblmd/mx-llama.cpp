@@ -1903,7 +1903,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (!bufs.back()) {
+            return nullptr; // OOM — backend already logged the error
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -1953,13 +1955,16 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         }
         if (any_nonzero_slice) {
             meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
+            if (!meta_buf_ctx->bufs[i]) {
+                delete meta_buf_ctx;
+                return nullptr; // OOM — ggml_backend_alloc_ctx_tensors_from_buft already logged the error
+            }
         } else {
             meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;
@@ -3662,9 +3667,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         ggml_backend_buffer_ptr & buf_ptr = bcj.bufs[i_buf];
         if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < backend_ctx->max_tmp_size) {
             buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
+            if (!buf_ptr) {
+                return false; // OOM — backend logged the error
+            }
         }
         tensor->buffer = buf_ptr.get();
         tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
+        return true;
     };
     // FIXME usage_counts
     auto get_cgraph_aux = [&]() -> ggml_cgraph * {
@@ -3715,7 +3724,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
-            set_tmp_data(node_tmp, lane_lo + k_dst, i_buf);
+            if (!set_tmp_data(node_tmp, lane_lo + k_dst, i_buf)) {
+                return GGML_STATUS_ALLOC_FAILED;
+            }
 
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
