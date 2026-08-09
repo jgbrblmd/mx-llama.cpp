@@ -2984,7 +2984,6 @@ private:
             if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                 has_pending_prompt = true;
             }
-<<<<<<< HEAD
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3051,6 +3050,7 @@ private:
                 if (!has_pending_prompt) {
                     phase_prefill = false;
                 }
+            }
         }
 
         if (!do_prefill) {
