@@ -966,7 +966,10 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    // a fully-masked query row has sumexp 0 in every split - emit 0 instead of
+    // 0/0 = NaN, which otherwise poisons the logits (observed as ggml_argmax
+    // returning -1 and an illegal get_rows in the DSpark markov head)
+    dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
 }
 
 template <int DV, int ncols1, int ncols2>

@@ -1018,7 +1018,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
-        case LLM_ARCH_DEEPSEEK4:
+        // DEEPSEEK4 runs -sm tensor via llm_arch_sm_tensor_replicates_attention (design A)
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
@@ -1036,5 +1036,18 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
             return false;
         default:
             return true;
+    }
+}
+
+bool llm_arch_sm_tensor_replicates_attention(const llm_arch & arch) {
+    // MLA archs share a single KV latent head that cannot be head-split, so the
+    // attention is replicated (design A) and only the experts/FFN are split.
+    switch (arch) {
+        case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
+            return true;
+        default:
+            return false;
     }
 }

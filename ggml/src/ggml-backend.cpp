@@ -759,7 +759,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 4
+#define GGML_SCHED_MAX_COPIES 16
 #endif
 
 struct ggml_backend_sched_split {
@@ -896,7 +896,24 @@ static int ggml_backend_sched_default_n_copies(ggml_backend_t * backends, int n_
         return 1;
     }
 
-    size_t n_copies = std::min<size_t>(4, GGML_SCHED_MAX_COPIES);
+    // The ring depth bounds how many ubatches can be in flight, and therefore
+    // how many pipeline stages can compute at once: a layer pipeline over N
+    // GPUs needs N slots to keep every stage busy, and the fixed default of 4
+    // left half of an 8-GPU pipeline idle. Every slot costs another copy of
+    // the graph inputs, so GGML_SCHED_N_COPIES overrides this either way.
+    static const size_t n_copies_env = []() {
+        const char * env = getenv("GGML_SCHED_N_COPIES");
+        return env != nullptr ? (size_t) std::max(1, atoi(env)) : (size_t) 0;
+    }();
+
+    size_t n_devices = 0;
+    for (int i = 0; i < n_backends; i++) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            n_devices++;
+        }
+    }
+
+    size_t n_copies = n_copies_env != 0 ? n_copies_env : std::max<size_t>(4, n_devices);
     for (int i = 0; i < n_backends; i++) {
         if (ggml_backend_is_meta(backends[i])) {
             n_copies = std::max(n_copies, ggml_backend_meta_n_stages(backends[i]));
@@ -1027,6 +1044,17 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
     }
 
     if (slot->buffer == nullptr || slot->size < size) {
+        // Grow in geometric steps rather than to the exact size. Pinned host
+        // allocation and free synchronize the device, so a slot that grows by
+        // one ubatch worth of mask on every prefill step drains the pipeline
+        // once per step. Rounding up amortizes that to O(log n) reallocations
+        // over a prefill: 16k-context tps4 prefill 380 -> 445 t/s.
+        size_t alloc_size = 1024*1024;
+        while (alloc_size < size) {
+            alloc_size *= 2;
+        }
+        size = alloc_size;
+
         ggml_backend_buffer_free(slot->buffer);
 
         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
@@ -1084,6 +1112,18 @@ static size_t ggml_backend_sched_input_staging_type_max_size(ggml_backend_t back
             }();
             return max_size != (size_t) -1 ? max_size :
                 (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 4096 : (size_t) 0);
+        }
+        case GGML_TYPE_F16: {
+            // f16 kq masks are the largest per-ubatch inputs (n_kv x n_ubatch).
+            // The unstaged fallback copies them synchronously, which blocks the
+            // host on the lane stream behind the whole in-flight graph and
+            // serializes prefill chunks. Stage them like the other inputs.
+            static const size_t max_size = []() {
+                const char * env = getenv("GGML_SCHED_INPUT_STAGING_F16_MAX");
+                return env != nullptr ? (size_t) atoll(env) : (size_t) -1;
+            }();
+            return max_size != (size_t) -1 ? max_size :
+                (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 512*1024*1024 : (size_t) 0);
         }
         default:
             return 0;
@@ -1811,9 +1851,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
     }
-
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    bool allocated = !backend_ids_changed && ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+    if (!allocated) {
+        // The assignment changed or the active layout does not fit. Before
+        // paying the reserve (which drains every backend and serializes any
+        // cross-chunk pipeline overlap), try the allocation-layout cache with
+        // the current buffer-id assignment - a hit re-binds without a drain
+        // and is valid for any buffer count because only an exactly-matching
+        // assignment is adopted.
+        allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
+                sched->node_backend_ids, sched->leaf_backend_ids);
+    }
+    if (!allocated) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif

@@ -304,7 +304,10 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    llama_token sampled; // in speculative mode, this is the last accepted token
+    // in speculative mode, this is the last accepted token. LLAMA_TOKEN_NULL until
+    // the first token of the task is sampled - drafting must not start before then
+    // (a null anchor reaches the draft graph as get_rows index -1)
+    llama_token sampled = LLAMA_TOKEN_NULL;
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
     // corresponding to one token position (size = n_embd)
@@ -2895,6 +2898,7 @@ private:
         }
     }
 
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -2975,14 +2979,66 @@ private:
         // when all prompts are done does generation start; generation then runs
         // to completion before the next prefill phase begins.
         bool has_pending_prompt = false;
-        bool has_active_generation = false;
 
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                 has_pending_prompt = true;
             }
-            if (slot.state == SLOT_STATE_GENERATING) {
-                has_active_generation = true;
+<<<<<<< HEAD
+            // check if we can batch this slot with the previous one
+            if (!slot_batched) {
+                slot_batched = &slot;
+            } else if (!slot_batched->can_batch_with(slot)) {
+                return;
+            }
+
+            generating.push_back(&slot);
+
+            if (spec) {
+                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+
+                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                const int n_draft_max = slot.get_n_draft_max();
+
+                // with the deferred sampling of chunked prefill, a slot can reach
+                // pre_decode before its first token was sampled - no anchor to
+                // draft from yet, skip this iteration
+                if (n_draft_max > 0 && slot.sampled != LLAMA_TOKEN_NULL) {
+                    GGML_ASSERT(slot.can_speculate());
+
+                    if (!slot.spec_draft.empty()) {
+                        // we have a previous (partial) draft to reuse
+                        if (use_ckpt_tgt) {
+                            GGML_ASSERT(!slot.spec_ckpt.empty());
+                        }
+                    } else {
+                        GGML_ASSERT(slot.spec_i_batch.empty());
+
+                        slot.spec_ckpt.update_pos(
+                                slot.prompt.n_tokens(),
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                        if (use_ckpt_dft) {
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+
+                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+
+                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                            /* .drafting = */ true,
+                            /* .n_max    = */ n_draft_max,
+                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .id_last  = */ slot.sampled,
+                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .result   = */ &slot.spec_draft,
+                        };
+
+                        drafting.push_back(&slot);
+                    }
+                }
             }
         });
 
@@ -2995,11 +3051,6 @@ private:
                 if (!has_pending_prompt) {
                     phase_prefill = false;
                 }
-            } else if (!has_active_generation) {
-                // all generation done: start a prefill phase if prompts are pending
-                phase_prefill = has_pending_prompt;
-                do_prefill = has_pending_prompt;
-            }
         }
 
         if (!do_prefill) {
@@ -3630,6 +3681,22 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         if (!is_user_start && !near_prompt_end) {
+                            do_checkpoint = false;
+                        }
+
+                        // LLAMA_NO_MIDPROMPT_CKPT=1: skip ALL mid-prompt checkpoints.
+                        // llama_state_seq_get_data_ext drains the whole scheduler
+                        // pipeline, so every mid-prompt checkpoint serializes the
+                        // prefill rounds (measured 0.7-2.1 s per checkpoint on 8-GPU
+                        // -sm tensor, the drain tagged via LLAMA_SYNC_TRACE). The
+                        // near-prompt-end checkpoint is preserved - it is the one
+                        // that enables decode-time rollback. Mid-prompt checkpoints
+                        // only speed up partial prompt-cache reuse across requests.
+                        static const bool no_mid_ckpt = []() {
+                            const char * env = getenv("LLAMA_NO_MIDPROMPT_CKPT");
+                            return env && atoi(env) != 0;
+                        }();
+                        if (no_mid_ckpt && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }

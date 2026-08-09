@@ -359,6 +359,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    // MLA (deepseek) design-B head-split routing, see head_split_attention below
+    static const std::regex pattern_mla_q_b         ("blk\\.\\d*\\.attn_q_b.weight");
+    static const std::regex pattern_mla_out_a       ("blk\\.\\d*\\.attn_output_a.weight");
+    static const std::regex pattern_mla_out_b       ("blk\\.\\d*\\.attn_output_b.weight");
+
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
@@ -432,7 +437,170 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // Design A: replicate the attention, split only the experts/FFN. See
+    // llm_arch_sm_tensor_replicates_attention.
+    // The TP group width. A tensor is sharded across this many lanes, see the lane_base
+    // computation further down. Needed here because the DFlash routing below has to know
+    // whether a head split would divide evenly before it commits to one.
+    const size_t tp_width_eff = ud->n_stages > 0 ? ud->n_devices / ud->n_stages : ud->n_devices;
+
+    // A DFlash sidecar can carry a full DeepSeek-V4 backbone instead of the small dense
+    // stack the replication default further down was tuned for: the DSpark drafter for
+    // DeepSeek-V4-Flash is 3 DSV4 blocks and 7-11 GB, against 6 dense layers and 0.39 GB
+    // for the Qwen3.6-35B one. Replicating that is expensive twice over - it needs its
+    // full size on every lane, which puts the 10.9 GB MXFP4 build out of reach at 8 GPUs,
+    // and every lane redundantly computes the whole drafter. Measured on
+    // DeepSeek-V4-Flash over a 200 token generation, draft encode / draft generate:
+    // 6713 / 1287 ms replicated under -sm tensor against 2017 / 877 ms for the same
+    // drafter layer-split under -sm layer, a 3.3x difference that shows up directly as
+    // tg 18.3 vs 20.1 t/s. So route a DSV4-backbone drafter like the target instead.
+    //
+    // The head split needs the group width to divide the output groups and the heads. A
+    // drafter inherits the device count but not necessarily a compatible -tpsd, so fall
+    // back to replication when it does not divide rather than aborting the load.
+    const bool dflash_dsv4 = ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0;
+    const bool dflash_dsv4_split = dflash_dsv4 && tp_width_eff > 0 &&
+                                   hparams.dsv4_o_group_count % tp_width_eff == 0 &&
+                                   hparams.n_head() % tp_width_eff == 0;
+    if (dflash_dsv4 && !dflash_dsv4_split) {
+        LLAMA_LOG_WARN("%s: DSV4 draft backbone cannot be split %zu ways, replicating it\n",
+                       __func__, tp_width_eff);
+    }
+
+    const bool replicate_attention = llm_arch_sm_tensor_replicates_attention(ud->model->arch) ||
+                                     dflash_dsv4_split;
+
+    // Head-split the MLA attention instead of replicating it, so each device computes
+    // n_head/n_devices heads rather than all of them. The KV latent is a single head (head_count_kv == 1) and stays MIRRORED
+    // either way, so this distributes attention COMPUTE, not the KV cache.
+    //
+    // Routing follows vLLM DeepseekV2MLAAttention:
+    //   q_a / q_a_norm / kv / kv_a_norm -> ReplicatedLinear -> MIRRORED (fall through)
+    //   q_b                             -> ColumnParallel   -> AXIS_1, head-splits Q
+    //   attn_sinks                      -> per head         -> AXIS_0
+    // DeepSeek-V4's output projection is a GROUPED LoRA: wo_a is applied per output
+    // group and wo_b reduces the concatenated groups. With n_head/n_devices heads per
+    // device the head split lands exactly on group boundaries, so a device owns whole
+    // groups. That makes wo_a a group-axis split (AXIS_1, a concatenation, no reduce)
+    // and wo_b the row-parallel step that produces PARTIAL and owes the all-reduce.
+    // On by default. LLAMA_MLA_TP=0 falls back to mirroring the whole attention stack
+    // and splitting only the experts, which is correct but leaves the attention mass
+    // replicated on every device.
+    static const bool mla_tp_env = [] {
+        const char * s = getenv("LLAMA_MLA_TP");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    // DEEPSEEK4 only for now. The routing below keys off V4's GROUPED LoRA output
+    // (attn_output_a/attn_output_b). DEEPSEEK2/32 have a plain attn_output.weight that
+    // matches none of those rules, so they would fall through to the design-A mirror and
+    // silently compute a wrong result instead of failing. They also have a kv_b
+    // up-projection that needs its own head-split rule. Add both before widening this.
+    // A DSV4-backbone DFlash drafter carries the same grouped-LoRA output and the same
+    // single-head KV latent, so it takes the identical routing.
+    const bool head_split_attention = mla_tp_env && replicate_attention &&
+                                      (ud->model->arch == LLM_ARCH_DEEPSEEK4 || dflash_dsv4_split);
+    if (mla_tp_env && replicate_attention && !head_split_attention) {
+        LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A\n", __func__);
+    }
+    if (head_split_attention) {
+        // A device must own whole output groups for the wo_a group split to be valid, and
+        // whole heads for the Q split. Both constraints are on the TP GROUP WIDTH, not on
+        // the total device count - n_devices is every device under the Meta device, and
+        // the group is n_devices/n_stages (see the tps computation further down). Checking
+        // the total instead would wrongly reject e.g. 6 or 10 GPUs at -tps 2, which are
+        // perfectly valid (3 or 5 pipeline stages of a 2-wide group).
+        // A drafter that fails these has already fallen back to replication above.
+        GGML_ASSERT(tp_width_eff > 0 && hparams.dsv4_o_group_count % tp_width_eff == 0 &&
+                    "LLAMA_MLA_TP needs the TP group width to divide the output group count");
+        GGML_ASSERT(hparams.n_head() % tp_width_eff == 0 &&
+                    "LLAMA_MLA_TP needs the TP group width to divide the head count");
+    }
+
     auto get_tensor_config = [&]() -> tensor_config {
+        // Vocabulary-parallel logits are incompatible with any vocabulary-global op run
+        // inside the graph. The DSpark draft head is exactly that: it chains
+        // argmax(logits) -> get_rows(markov_w1) -> mul_mat(markov_w2) once per drafted
+        // position, so a device holding 1/tps of the vocabulary would argmax its own
+        // shard and pick the wrong token. The meta backend catches it (ARGMAX asserts on
+        // an AXIS_0 input) rather than computing something wrong, which is why DSpark
+        // aborts under -sm tensor instead of drafting badly.
+        //
+        // Splitting the head differently cannot fix this - the argmax needs every logit
+        // on one device. Replicate the projection instead. That costs one copy of the
+        // output matrix per device and makes the head's logits MIRRORED, which is what
+        // the rest of the drafter already is. The projection itself is one GEMM over
+        // n_tokens (the drafted block, single digits) so the lost parallelism is noise.
+        if (ud->model->tensor_mirror_output() &&
+                (std::regex_match(tensor_name, pattern_output_weight) ||
+                 std::regex_match(tensor_name, pattern_output_bias))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        // A small dense drafter is best replicated: splitting it is a bad trade because
+        // the per-layer AllReduce costs far more than the compute it saves. The
+        // Qwen3.6-35B-A3B DFlash drafter is 6 layers and 0.39 GB against a 40-layer 34 GB
+        // target, and a split draft forward costs a large fraction of a target decode
+        // step while the redundant compute of a replica is negligible.
+        //
+        // That stops being true once the drafter is a DSV4 backbone, which is why
+        // dflash_dsv4_split above sends those down the target's routing instead. See the
+        // measurement there.
+        //
+        // LLAMA_DRAFT_SPLIT forces the choice either way and overrides both defaults.
+        if (ud->model->arch == LLM_ARCH_DFLASH) {
+            static const int draft_split_env = [] {
+                const char * s = getenv("LLAMA_DRAFT_SPLIT");
+                return s == nullptr ? -1 : atoi(s);
+            }();
+            const bool split_draft = draft_split_env < 0 ? dflash_dsv4_split : draft_split_env != 0;
+            if (!split_draft) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+        if (head_split_attention) {
+            if (std::regex_match(tensor_name, pattern_mla_q_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_mla_out_a)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_mla_out_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            // Two further splits were tried on V4's attention side and neither ships.
+            //
+            // The sparse indexer head-split: its per-head scores combine with sum_rows,
+            // so a split leaves a PARTIAL whose all-reduce carries the whole score
+            // matrix, and that cost grows with context. Measured -37% at pp8192.
+            //
+            // The hyper-connection mix projections on their contraction axis: hc_fn is
+            // [4*n_embd, 24], and sharding AXIS_0 gives each device [4*n_embd/tps, 24]
+            // while the activation stays full width, so rocBLAS is handed k=4*n_embd
+            // against lda=4*n_embd/tps and rejects it with INVALID_VALUE. Prefill aborts
+            // outright. Splitting the contraction axis needs a matching split of the
+            // input, which is not modelled here.
+            //
+            // Both keep the design-A mirror below.
+            // everything else attention-side (indexer, hyper-connection, compressor,
+            // KV cache) keeps the design-A mirror below
+        }
+        if (replicate_attention) {
+            // split only the FFN/experts and the output projection, mirror all the rest
+            const bool is_ffn =
+                std::regex_match(tensor_name, pattern_ffn_up_weight)      || std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_bias)       || std::regex_match(tensor_name, pattern_ffn_gate_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_weight)   || std::regex_match(tensor_name, pattern_ffn_down_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+            const bool is_output =
+                std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias);
+            if (!is_ffn && !is_output) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            // else fall through to the FFN / output patterns below
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -635,6 +803,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
+                if (head_split_attention) {
+                    // Design B splits the sinks per QUERY head so they line up with the Q
+                    // head split. The GQA granularity below is n_gqa, which under MQA
+                    // (n_head_kv == 1, as in deepseek MLA) is every head at once - it would
+                    // round every device down to zero and land all the sinks on one device.
+                    return {1};
+                }
                 return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
             }
 
@@ -1797,6 +1972,15 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+bool llama_model::tensor_mirror_output() const {
+    // Internal bridge instead of a public llama_model_params field. The one
+    // consumer that needs a replicated output projection under tensor split
+    // (the DSpark drafter's in-graph vocabulary-global argmax) sets this in
+    // common_model_params_to_llama before the model loads.
+    const char * env = getenv("LLAMA_TENSOR_MIRROR_OUTPUT");
+    return env != nullptr && atoi(env) != 0;
 }
 
 uint32_t llama_model::n_gpu_layers() const {

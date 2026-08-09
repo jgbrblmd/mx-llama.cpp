@@ -621,6 +621,23 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     }
 
 
+    // Phase-aware rollback snapshot/restore planning. Speculative rollback
+    // only ever targets positions within the current verify window, and every
+    // rollbackable batch snapshots its own pre-batch state (the
+    // d <= n_seq_tokens planes), so snapshot planning on prompt-prefill
+    // batches is dead weight - measured as the whole 2.4x -sm layer prefill
+    // cost with a drafter attached (+14 sched splits, state copies on every
+    // device per ubatch). A prefill batch is detected per sequence: many
+    // tokens with at most one logit output. A batched verify wants logits for
+    // every token of the sequence and keeps full planning regardless of batch
+    // size. A pending rollback is always restored, even on a prefill batch.
+    // Set LLAMA_DSV4_NO_PREFILL_SNAPSHOT=0 to force the old always-on
+    // planning.
+    static const bool no_pp_snap = []() {
+        const char * env = getenv("LLAMA_DSV4_NO_PREFILL_SNAPSHOT");
+        return !env || atoi(env) > 0;
+    }();
+
     if (n_rs_seq > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
@@ -628,8 +645,25 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 continue;
             }
 
-            const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
+            std::vector<uint32_t> token_idxs;
+            token_idxs.reserve(ubatch.n_tokens);
+            uint32_t n_out = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (dsv4_token_has_seq(ubatch, i, seq_id)) {
+                    token_idxs.push_back(i);
+                    if (ubatch.output && ubatch.output[i]) {
+                        n_out++;
+                    }
+                }
+            }
+
             const uint32_t rollback = (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
+            const bool is_prefill = token_idxs.size() >= 64 && n_out <= 1;
+            if (no_pp_snap && is_prefill && rollback == 0) {
+                continue;
+            }
+
+            const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
             // Keep the restore graph fixed-width when no rollback is pending.
             const int64_t src_plane = rollback > 0 && rollback <= n_rs_seq ? (int64_t) rollback*state_rows : 0;
             for (uint32_t r = 0; r < state_size; ++r) {
@@ -637,12 +671,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
             }
 
-            std::vector<uint32_t> token_idxs;
-            token_idxs.reserve(ubatch.n_tokens);
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (dsv4_token_has_seq(ubatch, i, seq_id)) {
-                    token_idxs.push_back(i);
-                }
+            if (no_pp_snap && is_prefill) {
+                // restore for the pending rollback is planned above, the
+                // prefill batch itself still does not need snapshots
+                continue;
             }
             if (token_idxs.empty()) {
                 continue;
@@ -811,8 +843,17 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
 
     const uint64_t state_rows = (uint64_t) state_size*n_stream;
     const size_t n_persist = (size_t) std::min<uint64_t>(ubatch.n_tokens, state_rows);
-    const size_t n_restore = n_rs_seq > 0 ? (size_t) state_size*std::max<uint32_t>(1, ubatch.n_seqs_unq) : 0;
-    const size_t n_snapshot = (size_t) n_rs_seq*state_size*std::max<uint32_t>(1, ubatch.n_seqs_unq);
+    // must mirror the phase-aware snapshot gate in the plan fill above -
+    // reserve ubatches are synthetic (zero output flags), so per-seq output
+    // counting reduces to the per-seq token count here, assuming no pending
+    // rollback (a rollback-pending prefill re-reserves once, which is fine)
+    static const bool no_pp_snap = []() {
+        const char * env = getenv("LLAMA_DSV4_NO_PREFILL_SNAPSHOT");
+        return !env || atoi(env) > 0;
+    }();
+    const bool skip_rs = no_pp_snap && n_seq_tokens >= 64;
+    const size_t n_restore = (n_rs_seq > 0 && !skip_rs) ? (size_t) state_size*std::max<uint32_t>(1, ubatch.n_seqs_unq) : 0;
+    const size_t n_snapshot = (n_rs_seq > 0 && !skip_rs) ? (size_t) n_rs_seq*state_size*std::max<uint32_t>(1, ubatch.n_seqs_unq) : 0;
 
     plan.state_pos .resize(ubatch.n_tokens);
     plan.state_persist_src_idxs.resize(n_persist);

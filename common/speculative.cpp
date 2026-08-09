@@ -159,6 +159,27 @@ struct common_speculative_impl {
     int64_t t_draft_us   = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us  = 0; // total time spent in accumulation of this implementation in microseconds.
 
+    // Breakdown of t_process_us for the DFlash/DSpark path, which is the dominant cost
+    // on a multi-GPU target: per draft cycle it gathers the target's hidden states to
+    // host, runs the draft encoder, reads its output back to host, then runs a second
+    // draft graph to inject K/V. Measured at ~98 ms per call for 1-5 tokens on 8 GPUs,
+    // which is 2.3 target decode steps for a 3-layer model, so the split matters.
+    int64_t t_tgtsync_us = 0; // waiting for the target's decode to land
+    int64_t t_gather_us  = 0; // target hidden states -> host
+    int64_t t_encode_us  = 0; // llama_encode on the draft (graph launch)
+    int64_t t_readnx_us  = 0; // llama_get_embeddings_nextn -> host
+    int64_t t_inject_us  = 0; // llama_decode on the draft, K/V injection (graph launch)
+
+    // Prompt-sized chunks only, so the draft's share of the PREFILL regression can be
+    // separated from its per-token decode cost. Attaching the drafter costs 3.2 s of
+    // prefill on an 1800 token prompt and the drafter's own encode+inject totals under
+    // 0.6 s across a whole run, so most of that regression is somewhere else.
+    int64_t t_pp_tgtsync_us = 0;
+    int64_t t_pp_gather_us = 0;
+    int64_t t_pp_encode_us = 0;
+    int64_t t_pp_inject_us = 0;
+    int64_t n_pp_rows      = 0;
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
     virtual ~common_speculative_impl() = default;
@@ -530,6 +551,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // turn on extraction of the draft model's pre-norm hidden state
         // (used both for the encoder output g_embd and the decoder pre-norm output).
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        // pay the flagged scheduler re-reserve now - inside the first decode it
+        // lands in the measured prompt processing time
+        llama_sched_reserve(ctx_tgt);
+        llama_sched_reserve(ctx_dft);
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
@@ -941,6 +967,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // Deferred prompt encode: with the target-side accum enabled, prompt chunks are
+    // only recorded here by process() (no target synchronize, no encode) and replayed
+    // by flush_pending() at the first draft. Chunk boundaries are preserved so the
+    // injected KV content is identical to the eager path.
+    struct pending_chunk {
+        llama_seq_id seq_id;
+        llama_pos    p0;
+        int32_t      n;
+    };
+    std::vector<pending_chunk> pending;
+    bool accum_enabled = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -970,7 +1008,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 block_size = std::atoi(buf);
             }
         }
+        // A sidecar drafter can be converted with tokenizer.ggml.model = no_vocab, and then
+        // its token list is empty, so llama_vocab rejects every special token id the GGUF
+        // declares as out of range and hands back LLAMA_TOKEN_NULL. The drafter shares the
+        // target's tokenizer by construction - it borrows the target's token embeddings and
+        // output projection - so read the mask from the target when the sidecar has none.
+        // Without this the whole noise block is filled with -1 and every draft is discarded:
+        // measured on the DeepSeek-V4 DSpark sidecar as 198 'invalid token[1] = -1' errors
+        // over a 200 token generation, one per draft call.
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_tgt));
+        }
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            LOG_ERR("%s: neither the draft nor the target vocab declares a mask token, "
+                    "the draft blocks cannot be built\n", __func__);
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
@@ -999,12 +1052,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+        const uint32_t n_taps = target_layer_ids_n;
+        for (uint32_t k = 0; k < n_taps; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // pay the flagged scheduler re-reserve now - inside the first decode it
+        // lands in the measured prompt processing time
+        llama_sched_reserve(ctx_tgt);
+        llama_sched_reserve(ctx_dft);
+
+        // Position-indexed tap accum lets process() skip its per-chunk target
+        // synchronize during prompt prefill. That synchronize flushes the target's
+        // async pipeline after every prefill ubatch, which is the bulk of the DFlash
+        // prefill cost. Single sequence only - the accum is indexed by position and
+        // multiple sequences would collide. LLAMA_DFLASH_DEFER=0 restores the eager
+        // per-chunk path.
+        {
+            const char * s = getenv("LLAMA_DFLASH_DEFER");
+            const bool want = s == nullptr || atoi(s) != 0;
+            if (want && n_seq == 1) {
+                accum_enabled = llama_set_embeddings_layer_inp_accum(ctx_tgt, (int32_t) llama_n_ctx(ctx_tgt)) != nullptr;
+            }
+            LOG_INF("%s: deferred prompt encode %s\n", __func__, accum_enabled ? "enabled" : "disabled");
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1022,12 +1096,134 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // replay any chunks still deferred (matches what the eager path would have
+        // already injected by this point) so the coverage check below sees the
+        // draft KV in its final state
+        if (!pending.empty() && !flush_pending()) {
+            LOG_ERR("%s: deferred prompt encode replay failed\n", __func__);
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    // Replay the first `count` deferred prompt chunks: bound the wait to the rows
+    // being read (per-ubatch readiness events, falling back to a full target
+    // synchronize), then the same per-chunk encode+inject sequence as the eager
+    // path, reading the tap rows from the position-indexed accum. Chunk sizes and
+    // order are preserved, so the draft KV content is identical. With count <
+    // pending.size() (the lag-one path) the target keeps computing the newest
+    // chunk while the draft works.
+    bool flush_pending_upto(size_t count) {
+        count = std::min(count, pending.size());
+        if (count == 0) {
+            return true;
+        }
+        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_dft = params.ctx_dft;
+
+        std::vector<const float *> accum(target_layer_ids_n, nullptr);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            accum[k] = llama_get_embeddings_layer_inp_accum(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!accum[k]) {
+                GGML_ABORT("DFlash: target layer %d accum not available.", target_layer_ids[k]);
+            }
+        }
+
+        // one wait covers every chunk in scope - stream order means the event of
+        // the last one implies all earlier rows have arrived
+        {
+            common_time_meas tm_tgtsync(t_pp_tgtsync_us, !gen_perf);
+            const auto & last = pending[count - 1];
+            if (!llama_layer_inp_accum_wait(ctx_tgt, last.p0 + last.n)) {
+                llama_synchronize(ctx_tgt);
+            }
+        }
+
+        // All encodes first, then all injects. Alternating llama_encode/llama_decode
+        // on the draft context swaps its graph every call, which defeats graph reuse
+        // and re-allocates per call - measured as inject 48 -> 1112 ms when the
+        // per-chunk replay alternated. Grouping keeps each graph warm across chunks.
+        std::vector<std::vector<float>> g_rows(count);
+        for (size_t c = 0; c < count; ++c) {
+            const auto & pc = pending[c];
+            {
+                common_time_meas tm_gather(t_pp_gather_us, !gen_perf);
+                features_buf.resize((size_t) pc.n * n_embd_enc);
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    for (int32_t i = 0; i < pc.n; ++i) {
+                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        const float * src = accum[k] + (size_t) (pc.p0 + i) * n_embd_tgt;
+                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ pc.n,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc;
+            {
+                common_time_meas tm_encode(t_pp_encode_us, !gen_perf);
+                rc = llama_encode(ctx_dft, enc_batch);
+            }
+            if (rc != 0) {
+                LOG_ERR("%s: deferred llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, p0=%d)\n",
+                        __func__, rc, (int) pc.n, (int) pc.p0);
+                return false;
+            }
+
+            const float * inp_g;
+            {
+                common_time_meas tm_readnx(t_readnx_us, !gen_perf);
+                inp_g = llama_get_embeddings_nextn(ctx_dft);
+            }
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            g_rows[c].assign(inp_g, inp_g + (size_t) pc.n * n_embd_dec);
+        }
+
+        for (size_t c = 0; c < count; ++c) {
+            const auto & pc = pending[c];
+
+            batch_inject.n_tokens = pc.n;
+            std::memcpy(batch_inject.embd, g_rows[c].data(), (size_t) pc.n * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < pc.n; ++i) {
+                batch_inject.pos[i]       = pc.p0 + i;
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = pc.seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            int32_t rc;
+            {
+                common_time_meas tm_inject(t_pp_inject_us, !gen_perf);
+                rc = llama_decode(ctx_dft, batch_inject);
+            }
+            if (rc != 0) {
+                LOG_ERR("%s: deferred llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, p0=%d)\n",
+                        __func__, rc, (int) pc.n, (int) pc.p0);
+                return false;
+            }
+        }
+
+        pending.erase(pending.begin(), pending.begin() + count);
+        return true;
+    }
+
+    bool flush_pending() {
+        return flush_pending_upto(pending.size());
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1070,17 +1266,70 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                // a prompt chunk is many rows, a decode chunk is at most 1+n_max
+                // (draft blocks are <= block_size 5). The threshold MUST match the
+                // accum-write gate in llama_context::extract_layer_inputs - a chunk
+                // deferred here but not accumulated there reads zeros at the flush.
+                // 64 missed sub-64 final prompt chunks (2075 = 1024+1024+27) whose
+                // eager fallback re-introduced the mid-prefill pipeline flush,
+                // measured as +22 pct TTFT on tensor at 2075 tokens.
+                const bool is_pp = n_chunk >= 16;
+                if (is_pp) { n_pp_rows += n_chunk; }
+
+                // Deferred prompt encode: record the chunk and return without touching
+                // the target. The accum holds the tap rows at their positions and
+                // flush_pending() replays the encode at the first draft.
+                if (is_pp && accum_enabled) {
+                    const int32_t ib = i_batch_beg[seq_id] + offset;
+                    bool seq_pos = true;
+                    for (int32_t i = 1; i < n_chunk; ++i) {
+                        if (batch_in.pos[ib + i] != batch_in.pos[ib] + i) {
+                            seq_pos = false;
+                            break;
+                        }
                     }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    if (seq_pos) {
+                        pending.push_back({seq_id, batch_in.pos[ib], n_chunk});
+                        // lag-one flush: replay every pending chunk except the one
+                        // just recorded. Its readiness event bounds the wait to
+                        // work already finished, so the target keeps computing the
+                        // newest chunk while the draft encodes and injects - the
+                        // same GPU overlap the eager path got from serializing.
+                        if (pending.size() > 1 && !flush_pending_upto(pending.size() - 1)) {
+                            return false;
+                        }
+                        continue;
+                    }
+                }
+
+                // any chunk taking the eager path must replay older deferred chunks
+                // first so the draft KV injections stay position-ordered
+                if (!pending.empty() && !flush_pending()) {
+                    return false;
+                }
+
+                // llama_get_embeddings_layer_inp below synchronizes the TARGET context,
+                // so without draining it here the wait for the target's verify would be
+                // charged to the extraction and the two could not be told apart.
+                {
+                    common_time_meas tm_tgtsync(is_pp ? t_pp_tgtsync_us : t_tgtsync_us, !gen_perf);
+                    llama_synchronize(ctx_tgt);
+                }
+
+                // gather this chunk's target features, interleaved by extract layer
+                {
+                    common_time_meas tm_gather(is_pp ? t_pp_gather_us : t_gather_us, !gen_perf);
+                    features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
                     }
                 }
 
@@ -1095,14 +1344,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                int32_t rc;
+                {
+                    common_time_meas tm_encode(is_pp ? t_pp_encode_us : t_encode_us, !gen_perf);
+                    rc = llama_encode(ctx_dft, enc_batch);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                const float * inp_g;
+                {
+                    common_time_meas tm_readnx(t_readnx_us, !gen_perf);
+                    inp_g = llama_get_embeddings_nextn(ctx_dft);
+                }
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
@@ -1115,7 +1372,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
+                {
+                    common_time_meas tm_inject(is_pp ? t_pp_inject_us : t_inject_us, !gen_perf);
+                    rc = llama_decode(ctx_dft, batch_inject);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1130,6 +1390,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        // the draft KV must hold the whole prompt before the noise block decodes
+        if (!pending.empty() && !flush_pending()) {
+            LOG_ERR("%s: deferred prompt encode replay failed - skipping drafts\n", __func__);
+            for (auto & dp : dparams) {
+                dp.drafting = false;
+            }
+            return;
+        }
+
         common_batch_clear(batch);
 
         // build one batch holding every drafting sequence's noise block into a single decode)
@@ -1140,6 +1409,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
+                continue;
+            }
+
+            // a null anchor would reach the token embedding and markov get_rows
+            // as index -1 - an illegal access, not a bad draft
+            if (dp.id_last < 0) {
+                dp.drafting = false;
                 continue;
             }
 
@@ -2467,6 +2743,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // The draft gets its own TP group width rather than inheriting the target's,
+        // which otherwise puts a small draft model on the target's pipeline stages.
+        result.tensor_parallel_size  = params_spec.tensor_parallel_size;
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
@@ -2939,6 +3219,21 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
             str_perf = ", dur(b,p,g,a) = " + oss.str() + " ms";
+            if (impl->t_gather_us + impl->t_encode_us + impl->t_readnx_us + impl->t_inject_us > 0) {
+                std::ostringstream sub;
+                sub << std::fixed << std::setprecision(3)
+                    << impl->t_tgtsync_us / 1000.0 << ", " << impl->t_gather_us / 1000.0 << ", "
+                    << impl->t_encode_us / 1000.0 << ", " << impl->t_readnx_us / 1000.0 << ", "
+                    << impl->t_inject_us / 1000.0;
+                str_perf += ", p(tgtsync,gather,encode,readnextn,inject) = " + sub.str() + " ms";
+                std::ostringstream pp;
+                pp << std::fixed << std::setprecision(3)
+                   << impl->t_pp_gather_us / 1000.0 << ", " << impl->t_pp_encode_us / 1000.0 << ", "
+                   << impl->t_pp_inject_us / 1000.0;
+                str_perf += ", prompt(tgtsync,gather,encode,inject) = "
+                         + std::to_string(impl->t_pp_tgtsync_us / 1000) + ", " + pp.str()
+                         + " ms over " + std::to_string(impl->n_pp_rows) + " rows";
+            }
         } else {
             str_perf = "";
         }

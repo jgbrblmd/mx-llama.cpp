@@ -55,6 +55,62 @@ drops from 11% to 2.5%. Prefill is unchanged by design. On by default;
 `GGML_META_TOKEN_GRAPH=0` restores the per-subgraph dispatch. Requires the
 concurrent lane dispatch above. Validated on gfx906.
 
+## DeepSeek-V4-Flash tensor parallelism
+
+Upstream keeps the deepseek4 architecture on the tensor-split unsupported list,
+so `-sm tensor` refuses to load it. The fork implements the split: the MLA heads
+divide across the tensor-parallel group with the attention-side state mirrored
+per lane, the lightning-indexer selection runs on the GPU at any context length
+(above 16384 columns it previously fell back to the CPU, which corrupted output
+past 65k context), and the indexer top-k needs no cross-lane broadcast because
+the fused scores are AllReduce outputs and already bit-identical on every lane.
+Byte-deterministic over a 100k-token greedy run, perplexity consistent with
+`-sm layer` within 0.3%. Works with multi-stage `-tps`. Validated on gfx906.
+
+## DSpark drafter under tensor parallelism
+
+The DSpark drafter runs an in-graph argmax over the full vocabulary on logits it
+produces, which a vocabulary shard cannot serve, so upstream's
+`--spec-type draft-dspark` did not work under `-sm tensor`. The drafter is now
+replicated per lane instead of split (a small dense drafter loses more to
+per-layer AllReduce than it gains from splitting), the no-vocab sidecar borrows
+the target tokenizer, and the target's output projection is replicated so every
+device holds the full logit row. Measured on DeepSeek-V4-Flash at `-tps 4` over
+8 GPUs: generation 18.0 to 27.3 t/s. Validated on gfx906.
+
+## Allocation layout cache
+
+A change in the scheduler's backend assignment forced a drain-and-reserve before
+reallocating, and under `-sm layer` pipeline parallelism that drain hit on every
+assignment flip, serializing the pipe. The allocator now caches layouts per
+graph topology keyed by the buffer assignment and rebinds without draining when
+only the assignment changed, which is bit-exact (outputs byte-identical,
+perplexity unchanged). Worth +377% prefill at 100k context on DeepSeek-V4-Flash
+across 8 GPUs. On by default; `GGML_GALLOC_LAYOUT_CACHE=0` restores the old
+path. Backend-generic.
+
+## Pipeline scheduling
+
+Two scheduler fixes for multi-GPU pipelines, both host-side and bit-exact.
+
+The pinned host buffers that stage graph inputs were allocated at exactly the
+requested size. Attention masks grow by one ubatch of columns on every prefill
+step, so every step freed and reallocated a slot - and pinned allocation and
+free synchronize the device, draining every GPU once per ubatch, with the cost
+scaling as the masks widen. They now grow in powers of two.
+
+The ring of input copies bounds how many ubatches can be in flight, and so how
+many pipeline stages can compute at once, but its depth was a fixed 4 whatever
+the topology: an 8-GPU layer pipeline kept about half its stages busy. The depth
+now follows the GPU count. Each slot costs another copy of the graph inputs, so
+GGML_SCHED_N_COPIES overrides it either way; tensor-parallel runs keep the depth
+their stage count asks for, which is what they want.
+
+Measured on DeepSeek-V4-Flash MXFP4 over 8 MI50 at 100k context, greedy output
+byte-identical in every arm:
+  -sm tensor -tps 4  prefill 167.0 -> 282.8 t/s  (+69%, staging)
+  -sm layer          prefill 426.9 -> 585.4 t/s  (+37%, ring depth)
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point

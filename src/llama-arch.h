@@ -714,4 +714,6 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+// under -sm tensor, replicate the attention on every device and split only the FFN/experts
+bool llm_arch_sm_tensor_replicates_attention(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);

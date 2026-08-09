@@ -345,6 +345,12 @@ struct common_params_speculative_draft {
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
+    // -sm tensor: GPUs per TP group for the DRAFT model, independent of the target's.
+    // A draft is small and runs one forward per drafted token, so the target's topology
+    // is rarely the right one for it. 0 keeps the draft in a single TP group over its
+    // own devices, which is what a 0.4 GB drafter wants next to a 40 GB target.
+    int32_t tensor_parallel_size = 0;
+
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 

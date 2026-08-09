@@ -754,6 +754,13 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // optional persistent device tensors for the layer-input taps, indexed by lid.
+    // When present, set_outputs copies each tap into its tensor in-graph instead of
+    // pinning it as an output, keeping the tap out of the galloc arena - taps in the
+    // arena change the packing so runtime graphs stop fitting the reserved plan and
+    // every prefill chunk pays a re-reserve plus an all-backend synchronize.
+    const std::vector<ggml_tensor *> * layer_inp_dev = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {

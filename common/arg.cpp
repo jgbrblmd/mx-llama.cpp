@@ -2742,6 +2742,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_PARALLEL_SIZE"));
     add_opt(common_arg(
+        {"-tpsd", "--spec-draft-tensor-parallel-size"}, "T",
+        "with -sm tensor: GPUs per TP group for the draft model. The draft does not inherit "
+        "-tps, because a pipeline stage costs it a cross-device transfer on every drafted "
+        "token. T=0 (default) puts the draft in a single TP group.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-tensor-parallel-size must be >= 0");
+            }
+            params.speculative.draft.tensor_parallel_size = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TENSOR_PARALLEL_SIZE"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

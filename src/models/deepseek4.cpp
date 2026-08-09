@@ -1289,7 +1289,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
-            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+            // expanded by set_outputs at the END of the build - expanding here walks
+            // the dependency chain in a different DFS order than the natural build
+            // and interleaves every device boundary, adding 2 sched splits per
+            // boundary under -sm layer (measured 65 vs 51 splits)
         }
 
         ggml_tensor * residual = inpL;
@@ -1371,7 +1374,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
-        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+        // expanded by set_outputs, see the per-layer taps above
     }
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);

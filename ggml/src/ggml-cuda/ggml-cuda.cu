@@ -4807,6 +4807,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                // GGML_CUDA_OP_SYNC=1: synchronize after every op so an
+                // asynchronously-detected fault is attributed to the node that
+                // caused it. Only the graph exec loop pays - unlike
+                // AMD_SERIALIZE_KERNEL this leaves the model load fast.
+                {
+                    static const bool op_sync = getenv("GGML_CUDA_OP_SYNC") != nullptr;
+                    if (op_sync) {
+                        const cudaError_t err = cudaStreamSynchronize(cuda_ctx->stream());
+                        if (err != cudaSuccess) {
+                            GGML_LOG_ERROR("op-sync fault at node %s (%s) src0=%s [%ld,%ld,%ld,%ld]: %s\n",
+                                    node->name, ggml_op_name(node->op),
+                                    node->src[0] ? node->src[0]->name : "-",
+                                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                                    cudaGetErrorString(err));
+                        }
+                        CUDA_CHECK(err);
+                    }
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -5943,9 +5962,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+#ifndef GGML_CUDA_USE_CUB
+            // Above the 16384-column shared-memory bitonic limit the
+            // hierarchical two-pass selection runs: per-segment bitonic top-k
+            // plus a candidate merge of n_seg * k entries, valid while that
+            // merge itself fits the bitonic. The CPU fallback this replaces
+            // fractured the graph into per-csa-layer host round-trips at
+            // n_kv = 65536 (the DSV4 indexer scores are n_kv/4 wide), which
+            // broke multi-stage -sm tensor and serialized prefill.
+            return op->src[0]->ne[0] <= 16384 ||
+                   ((op->src[0]->ne[0] + 16383)/16384) * op->ne[0] <= 16384;
+#else
+            return true;
+#endif
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
-            return op->src[0]->ne[0] <= 1024;
+            // strided bitonic kernel bound: ncols_pad ints of shared memory
+            // (16384 cols at the 64 KB gfx906 limit). The old 1024 gate sent the
+            // DSV4 lightning-indexer top_k to the CPU once a sequence passed
+            // ~1024 kv - 21 synchronous host round-trips per ubatch that
+            // serialize the -sm layer pipeline to one GPU at a time.
+            return op->src[0]->ne[0] <= 16384;
 #else
             return true;
 #endif

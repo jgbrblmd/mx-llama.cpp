@@ -663,6 +663,7 @@ struct llama_model {
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;
+    bool tensor_mirror_output() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;

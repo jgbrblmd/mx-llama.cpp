@@ -61,11 +61,12 @@ static __device__ __forceinline__ void barrier_end(
     __syncthreads();
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        *reinterpret_cast<volatile FlagType *>(&sg.signals[threadIdx.x]->end[blockIdx.x][rank]) = flag;
-        FlagType val;
-        do {
-            val = *reinterpret_cast<volatile FlagType *>(&self_sg->end[blockIdx.x][threadIdx.x]);
-        } while (val != flag);
+        // Release/acquire like barrier_start: the flag store must not pass the
+        // preceding payload peer-writes. Hardening - the HIP path always had
+        // this ordering.
+        st_flag_volatile(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag);
+        while (ld_flag_volatile(&self_sg->end[blockIdx.x][threadIdx.x]) != flag)
+            ;
     }
     if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }

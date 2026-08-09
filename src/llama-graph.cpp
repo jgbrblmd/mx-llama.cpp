@@ -19,6 +19,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1336,8 +1337,34 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
-            if (embeddings_layer_inp[il]) {
-                GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+            if (!embeddings_layer_inp[il]) {
+                continue;
+            }
+            GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+
+            ggml_tensor * dev = nullptr;
+            if (params.layer_inp_dev && il < params.layer_inp_dev->size()) {
+                dev = (*params.layer_inp_dev)[il];
+            }
+            // taps are no longer expanded at their build position (that reorders
+            // the graph and adds sched splits at every device boundary) - ensure
+            // they are in the graph here, at the end, in canonical order
+            ggml_build_forward_expand(gf, t_layer_inp[il]);
+
+            if (dev) {
+                // Copy the tap into its persistent device tensor. The tap then
+                // stays out of the galloc arena, so runtime graphs keep fitting
+                // the reserved plan - in-arena taps change the packing and every
+                // prefill chunk pays a re-reserve plus an all-backend
+                // synchronize. The extract reads the copy, whose data address is
+                // stable across graphs.
+                ggml_tensor * t = t_layer_inp[il];
+                GGML_ASSERT(t->ne[1] <= dev->ne[1]);
+                ggml_tensor * dst = ggml_view_2d(ctx_compute.get(), dev, t->ne[0], t->ne[1], dev->nb[1], 0);
+                ggml_tensor * cpy = ggml_cpy(ctx_compute.get(), t, dst);
+                ggml_build_forward_expand(gf, cpy);
+                t_layer_inp[il] = cpy;
+            } else {
                 ggml_set_output(t_layer_inp[il]);
             }
         }
@@ -1383,7 +1410,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", typeid(*input).name(), cur);
         }
 
         res = res && cur;
