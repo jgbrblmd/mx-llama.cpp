@@ -5620,6 +5620,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q4_0_ROCMFP4_FAST:
                     case GGML_TYPE_Q2_0_ROCMFPX:
                     case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
                     case GGML_TYPE_Q6_0_ROCMFPX:
                     case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_Q2_K:
@@ -5684,6 +5685,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0_ROCMFPX:
                     case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
                         return op->src[0]->ne[0] % QK_ROCMFP2 == 0;
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                        return op->src[0]->ne[0] % QK_ROCMFP3 == 0;
                     case GGML_TYPE_Q6_0_ROCMFPX:
                         return op->src[0]->ne[0] % QK_ROCMFP6 == 0;
                     case GGML_TYPE_Q8_0_ROCMFPX:
@@ -5781,6 +5784,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_Q2_0_ROCMFPX_AFFINE && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q3_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q3_0_ROCMFPX && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q6_0_ROCMFPX) {

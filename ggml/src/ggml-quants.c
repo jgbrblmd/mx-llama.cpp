@@ -690,6 +690,14 @@ void dequantize_row_rocmfpx_fp2_affine(const block_rocmfp2 * GGML_RESTRICT x, fl
     rocmfpx_dequantize_row_fp2_affine(x, y, k);
 }
 
+void quantize_row_rocmfpx_fp3_ref(const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp3_ref(x, y, k);
+}
+
+void dequantize_row_rocmfpx_fp3(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp3(x, y, k);
+}
+
 void quantize_row_rocmfpx_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k) {
     rocmfpx_quantize_row_fp6_ref(x, y, k);
 }
@@ -2410,6 +2418,12 @@ size_t quantize_nvfp4_e8m0(const float * GGML_RESTRICT src, void * GGML_RESTRICT
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_e8m0_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4_E8M0, n_per_row);
+}
+
+size_t quantize_rocmfpx_fp3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    rocmfpx_quantize_fp3(src, dst, nrow, n_per_row, quant_weights);
+    return nrow * ggml_row_size(GGML_TYPE_Q3_0_ROCMFPX, n_per_row);
 }
 
 size_t quantize_rocmfpx_fp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5693,6 +5707,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 GGML_UNUSED(nb);
             } break;
         case GGML_TYPE_Q2_0_ROCMFPX:
+            {
+                // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q3_0_ROCMFPX:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);
