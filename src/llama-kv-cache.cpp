@@ -1740,7 +1740,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             auto & idxs = seq_idxs[seq_id];
 
             if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
+                // NOTE: this optimization assumes tokens of the same sequence are
+                // contiguous within a stream. With a unified KV cache (n_stream == 1),
+                // all sequences share one stream and split_simple() interleaves their
+                // tokens, so copying the mask from a previous token of the same
+                // sequence would use an incorrect position. Disable the optimization
+                // in that case and recompute the full mask per token.
+                if (n_stream > 1 && seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
                     const uint64_t idst_prev = n_kv*srct;
