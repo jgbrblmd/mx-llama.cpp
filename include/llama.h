@@ -161,6 +161,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103, // ROCmFP4 single-scale speed layout
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX  = 110, // ROCmFPx experimental 6-bit reference layout
         LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX  = 111, // ROCmFPx experimental 8-bit reference layout
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX  = 114, // ROCmFPx experimental 3-bit reference layout
         LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX  = 112, // ROCmFPx experimental 2-bit S40 codebook layout
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
