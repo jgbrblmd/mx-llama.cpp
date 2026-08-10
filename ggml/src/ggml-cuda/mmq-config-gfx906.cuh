@@ -65,5 +65,11 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
         return ggml_cuda_mmq_config(
             GGML_TYPE_Q4_0_ROCMFP4_FAST, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
     }
+    // Q5_K: 8 warps + wide tiles like Q8_0; 3-buffer layout (qs, q8, scales)
+    // matches rdna2's, so smem accounting stays consistent. Tune candidate.
+    if (type == GGML_TYPE_Q5_K && J >= 8 && J <= 128 && (J % 8) == 0) {
+        return ggml_cuda_mmq_config(
+            GGML_TYPE_Q5_K, 512, 2, 128, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, fallback);
+    }
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 }
