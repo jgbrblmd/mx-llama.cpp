@@ -15,10 +15,12 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    // V-head order: MLX/u32-derived Qwen3.5-MoE GGUFs keep the grouped layout
-    // (v-head h pairs with k-head h / r), so default to grouped unless the key
-    // says the checkpoint was converted with the tiled V-head reorder.
-    hparams.ssm_v_heads_tiled = false;
+    // V-head order: official/upstream Qwen3.5/3.6 GGUFs use the tiled layout
+    // (v-head h pairs with k-head h % H_k; upstream converts and indexes tiled),
+    // so default to tiled unless the key says otherwise. MLX/u32-derived
+    // checkpoints (e.g. KAT-Coder) keep the grouped layout (h / r); they must
+    // carry the flag or run with --override-kv qwen35moe.ssm.v_heads_tiled=bool:false.
+    hparams.ssm_v_heads_tiled = true;
     ml.get_key(LLM_KV_SSM_V_HEADS_TILED, hparams.ssm_v_heads_tiled, false);
 
     // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
