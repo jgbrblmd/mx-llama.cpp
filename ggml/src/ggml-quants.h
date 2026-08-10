@@ -62,6 +62,8 @@ GGML_API void quantize_row_rocmfpx_fp2_ref(const float * GGML_RESTRICT x, block_
 GGML_API void dequantize_row_rocmfpx_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_rocmfpx_fp2_affine_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_rocmfpx_fp2_affine(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rocmfpx_fp3_ref(const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rocmfpx_fp3(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_rocmfpx_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_rocmfpx_fp6(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_rocmfpx_fp8_ref(const float * GGML_RESTRICT x, block_rocmfp8 * GGML_RESTRICT y, int64_t k);

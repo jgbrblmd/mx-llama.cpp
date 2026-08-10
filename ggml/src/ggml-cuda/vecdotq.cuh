@@ -331,6 +331,28 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q
     return d8_1*sumf;
 }
 
+// ROCmFP3 MMQ dp4a impl: same two half-block scales structure as ROCmFP6,
+// so with vdr = QI_ROCMFP3 = 8 packed ints this processes 1 FP3 block.
+template <int vdr> static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1_mmq_impl(
+    const int * v, const int * u, const float * d8_0, const float & d8_1) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i0 = 0; i0 < vdr; i0 += QI_ROCMFP3/2) {
+        int sumi = 0;
+
+#pragma unroll
+        for (int i = i0; i < i0 + QI_ROCMFP3/2; ++i) {
+            sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+        }
+
+        sumf += d8_0[i0/(QI_ROCMFP3/2)]*sumi;
+    }
+
+    return d8_1*sumf;
+}
+
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
@@ -567,6 +589,96 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
 
     const float db = __low2float(bq8_1->ds);
     return db * (ggml_cuda_ue4m3_to_fp32(bq6->e[0]) * sumi0 + ggml_cuda_ue4m3_to_fp32(bq6->e[1]) * sumi1);
+}
+
+// ROCmFP3: 32 weights / block, 12 bytes packed 3-bit codes + 2 UE4M3 scale
+// bytes (e[0] for weights 0..15, e[1] for weights 16..31); 3-bit code holds
+// magnitude {0, 1, 2, 4} in the low 2 bits and the sign in bit 2.
+// Signed code lookup: index = code, value = mag[code & 3] * (code & 4 ? -1 : 1).
+#define VDR_ROCMFP3_Q8_1_MMVQ 8
+#define VDR_ROCMFP3_Q8_1_MMQ  4
+
+static __device__ const int8_t rocmfpx_fp3_code_lut[8] = { 0, 1, 2, 4, 0, -1, -2, -4 };
+
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_bits12_vec_cuda(const uint32_t bits12) {
+#if defined(GGML_USE_HIP)
+    // One v_perm_b32 per 4-value group: build the four byte selectors directly
+    // from the 3-bit codes (selector byte == code, spread 3 bits apart with a
+    // single magic multiply), so the full 8-entry codebook {0,1,2,4,0,-1,-2,-4}
+    // fits in two v_perm operands and the hardware byte-permute does the lookup.
+    // ~9 ALU ops + 1 v_perm vs 4 LUT lookups, which is what makes the MMVQ/MMQ
+    // hot paths ALU-light on gfx906 (no tensor cores).
+    constexpr uint32_t M = 0x00008421u;
+    const uint32_t sel = ((bits12 & 0x249u) * M & 0x01010101u)
+                       | ((bits12 & 0x492u) * M & 0x02020202u)
+                       | ((bits12 & 0x924u) * M & 0x04040404u);
+    return __builtin_amdgcn_perm(0xFCFEFF00u, 0x04020100u, sel);
+#else
+    const char4 v = make_char4(
+        rocmfpx_fp3_code_lut[bits12 & 7u],
+        rocmfpx_fp3_code_lut[(bits12 >>  3) & 7u],
+        rocmfpx_fp3_code_lut[(bits12 >>  6) & 7u],
+        rocmfpx_fp3_code_lut[(bits12 >>  9) & 7u]);
+    return *((const int *) &v);
+#endif
+}
+
+// Unpack one 4-value group (12 bits) from the 3 register words holding the
+// block's 12 packed bytes. Caller loads the registers once per block.
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_qs3_vec_cuda(
+    const uint32_t * qs, const int base) {
+    const int start_bit = 3 * base;
+    const int reg_idx = start_bit >> 5;
+    const int reg_shift = start_bit & 31;
+    const uint32_t val_low  = qs[reg_idx];
+    const uint32_t val_high = qs[reg_idx + 1];
+    const uint32_t bits12 = (reg_shift == 0) ? (val_low & 0xFFFu) :
+        (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFu);
+
+    return rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
+}
+
+static __device__ __forceinline__ void rocmfpx_load_fp3_qs3_vec_cuda(
+    const block_rocmfp3 * bq3, uint32_t * qs) {
+    memcpy(&qs[0], bq3->qs + 0, 4);
+    memcpy(&qs[1], bq3->qs + 4, 4);
+    memcpy(&qs[2], bq3->qs + 8, 4);
+}
+
+// Load one block's packed bytes and unpack a single 4-value group. Used by the
+// MMQ tile loader, where each thread unpacks one group per block.
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_device_vec_cuda(
+    const block_rocmfp3 * bq3, const int base) {
+    uint32_t qs[3];
+    rocmfpx_load_fp3_qs3_vec_cuda(bq3, qs);
+    return rocmfpx_pack4_fp3_qs3_vec_cuda(qs, base);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp3 * bq3 = (const block_rocmfp3 *) vbq + kbx;
+
+    uint32_t qs[3];
+    rocmfpx_load_fp3_qs3_vec_cuda(bq3, qs);
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP3_Q8_1_MMVQ; ++i) {
+        const int base = 4 * (iqs + i);
+        const int val_packed = rocmfpx_pack4_fp3_qs3_vec_cuda(qs, base);
+        const int u = get_int_b4(bq8_1->qs, iqs + i);
+        if (base < QK_ROCMFP3/2) {
+            sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(val_packed, u, sumi1);
+        }
+    }
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (ggml_cuda_ue4m3_to_fp32(bq3->e[0]) * sumi0 + ggml_cuda_ue4m3_to_fp32(bq3->e[1]) * sumi1);
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp8_q8_1(

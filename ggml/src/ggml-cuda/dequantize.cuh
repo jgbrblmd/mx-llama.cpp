@@ -514,6 +514,39 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, c
 #endif
 }
 
+static __device__ __forceinline__ void dequantize_rocmfpx_fp3(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp3 * x = (const block_rocmfp3 *) vx;
+
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i0 >= QK_ROCMFP3/2]);
+    const float d1 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i1 >= QK_ROCMFP3/2]);
+
+    // Unpack 3-bit codes from compact layout
+    const uint8_t * qs = x[ib].qs;
+
+    uint32_t code0 = 0, code1 = 0;
+    for (int b = 0; b < 3; ++b) {
+        const int src_bit = 3 * i0 + b;
+        const uint8_t byte = qs[src_bit >> 3];
+        const int bit = src_bit & 7;
+        const uint32_t bit_val = (byte >> bit) & 1u;
+        code0 |= bit_val << b;
+
+        const int src_bit1 = 3 * i1 + b;
+        const uint8_t byte1 = qs[src_bit1 >> 3];
+        const int bit1 = src_bit1 & 7;
+        const uint32_t bit_val1 = (byte1 >> bit1) & 1u;
+        code1 |= bit_val1 << b;
+    }
+
+    static const int mag[4] = { 0, 1, 2, 4 };
+    const int value0 = mag[code0 & 3u];
+    v.x = d0 * (float) ((code0 & 4u) ? -value0 : value0);
+    const int value1 = mag[code1 & 3u];
+    v.y = d1 * (float) ((code1 & 4u) ? -value1 : value1);
+}
+
 static __device__ __forceinline__ void dequantize_rocmfpx_fp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_rocmfp8 * x = (const block_rocmfp8 *) vx;
 
