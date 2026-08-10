@@ -550,6 +550,16 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
+bool ggml_backend_event_query(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+
+    if (event->device->iface.event_query == NULL) {
+        return true;
+    }
+
+    return event->device->iface.event_query(event->device, event);
+}
+
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.event_wait != NULL);
@@ -1998,6 +2008,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->timing.n_non_graph_inputs += sched->timing.enabled ? 1 : 0;
                 // wait for the split backend to finish using the input before overwriting it
                 int64_t t0 = ggml_backend_sched_timing_now(sched);
+                // ROCm: with deep pipelining the enqueued event wait below does not
+                // reliably keep this copy from landing while a previous eval on this
+                // copy slot is still reading it, and tiny-ubatch multi-GPU prefill
+                // reliably hits the window (DSV4 -ub 4/32: gfxhub TCP faults). Every
+                // host-side bound closes it, so drain the destination in that regime
+                // only. Single-row (decode) and >= 64-row (production prefill) shapes
+                // keep the async pipeline. GGML_SCHED_SYNC_NONGRAPH=0/1 forces off/on.
+                {
+                    // Not static: llama sets this per-context (tiny n_ubatch) and
+                    // contexts with different n_ubatch share one process.
+                    const char * sync_env = getenv("GGML_SCHED_SYNC_NONGRAPH");
+                    if (sync_env != NULL && atoi(sync_env) != 0) {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                }
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {

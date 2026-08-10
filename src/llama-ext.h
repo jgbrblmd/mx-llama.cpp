@@ -151,6 +151,16 @@ LLAMA_API const float * llama_get_embeddings_layer_inp_accum(struct llama_contex
 // caller must then fall back to llama_synchronize.
 LLAMA_API bool llama_layer_inp_accum_wait(struct llama_context * ctx, llama_pos p_end);
 
+// Non-blocking form: true if the accum rows below p_end have already landed.
+// Lets a consumer replay finished work without giving up the host's queue lead.
+LLAMA_API bool llama_layer_inp_accum_ready(struct llama_context * ctx, llama_pos p_end);
+
+// Fork-local declaration of a ggml symbol rather than an edit to the public
+// ggml-backend.h. Defined in ggml-backend.cpp, dispatched through the device
+// interface. Backends without a query report true so a poller still advances.
+struct ggml_backend_event;
+GGML_API bool ggml_backend_event_query(struct ggml_backend_event * event);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

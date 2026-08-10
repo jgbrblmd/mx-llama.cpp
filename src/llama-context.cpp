@@ -308,6 +308,19 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
+
+    // Tiny-ubatch multi-GPU pipelining lets the host free-run ahead of lagging
+    // devices and race the sched's split-input copies (observed on ROCm, where
+    // enqueued cross-device event waits do not order reliably). Turn on the
+    // sched's host-drain for such configs before any sched is created. Setting
+    // the variable manually overrides this either way.
+    if (cparams.n_ubatch < 64) {
+#ifdef _WIN32
+        _putenv_s("GGML_SCHED_SYNC_NONGRAPH", "1");
+#else
+        setenv("GGML_SCHED_SYNC_NONGRAPH", "1", 0);
+#endif
+    }
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -441,6 +454,18 @@ llama_context::llama_context(
         // bit-exact) and frees the draft's ring memory, with no effect on prompt-eval. Opt back in
         // with LLAMA_MTP_DRAFT_PIPELINE for debugging.
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !getenv("LLAMA_MTP_DRAFT_PIPELINE")) {
+            pipeline_parallel = false;
+        }
+
+        // A sidecar drafter - identified by borrowing the target's context - drafts
+        // one token at a time, so the ring buys it nothing while its idle
+        // compute-buffer copies cost real time on a layer-split draft. Its prompt
+        // encode does not lose anything either, since that replays deferred against
+        // the target's chunks. Measured with the DSpark sidecar on
+        // DeepSeek-V4-Flash over 8 MI50 at 16k: -sm layer generation 23.0 -> 25.5
+        // t/s with prefill flat, -sm tensor unchanged. Opt back in with
+        // LLAMA_DRAFT_PIPELINE for debugging.
+        if (cparams.ctx_other != nullptr && !getenv("LLAMA_DRAFT_PIPELINE")) {
             pipeline_parallel = false;
         }
 
@@ -662,7 +687,13 @@ void llama_context::sched_reserve() {
         for (bool enabled : cparams.embeddings_layer_inp) {
             n_taps += enabled ? 1 : 0;
         }
-        if (want_static && n_taps > 0 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && model.dev_output()) {
+        // Tensor split defaults to in-arena taps because it does not show the
+        // realloc that motivated the persistent copy. That also excludes it from
+        // the event-ordered tap path, which is what gave -sm layer its prefill
+        // win, so LLAMA_TAP_STATIC=1 opts it in.
+        const bool tap_static_forced = s_tap_static != nullptr && atoi(s_tap_static) != 0;
+        const bool split_ok = model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || tap_static_forced;
+        if (want_static && n_taps > 0 && split_ok && model.dev_output()) {
             const ggml_init_params ip = {
                 /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) n_taps,
                 /*.mem_buffer =*/ nullptr,
@@ -1385,6 +1416,20 @@ bool llama_context::layer_inp_accum_wait(llama_pos p_end) {
     }
     ggml_backend_event_synchronize(best->event);
     return true;
+}
+
+bool llama_context::layer_inp_accum_ready(llama_pos p_end) {
+    // Same search as the wait, but it never blocks. Lets the drafter replay only
+    // what the target has already finished and hand the host straight back to
+    // feeding the target, instead of surrendering the whole queue lead: the
+    // events fire in stream order, so waiting on one means waiting for the
+    // device to reach that position, not for a copy to land.
+    for (const auto & ev : layer_inp_accum_events) {
+        if (ev.event && ev.pos_end >= p_end && ggml_backend_event_query(ev.event)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2507,10 +2552,20 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     // per-batch buffers. Small (decode/verify) ubatches are also skipped - the
     // consumer only reads prompt-sized chunks from the accum, and writing here
     // would tick the ring-drain counter and cost stray synchronizes during decode.
+    // Small (verify-sized) ubatches used to be excluded here so they would not
+    // tick the ring-drain counter. The tap is event-ordered now, so they can
+    // record a readiness event too - that lets a consumer wait on the tap
+    // instead of a full llama_synchronize, which during generation costs 5ms a
+    // token waiting on every backend rather than the one that has the rows.
+    static const int32_t accum_min = []() {
+        const char * e = getenv("LLAMA_TAP_ACCUM_MIN");
+        return e != nullptr ? atoi(e) : 16;
+    }();
     const bool accum_ok = layer_inp_accum && ubatch.pos && ubatch.n_seqs_unq == 1 &&
-                          n_tokens >= 16 && ubatch.pos[0] >= 0 &&
+                          (int32_t) n_tokens >= accum_min && ubatch.pos[0] >= 0 &&
                           (size_t) ubatch.pos[0] + n_tokens <= (size_t) layer_inp_accum_cap;
     bool accum_wrote = false;
+    bool taps_static = true;
     ggml_backend_t accum_backend = nullptr;
 
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -2544,6 +2599,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             ggml_backend_tensor_get_async(backend, t, dst, 0, nbytes);
             accum_wrote = true;
             accum_backend = backend;
+            if (il >= layer_inp_dev.size() || layer_inp_dev[il] == nullptr) {
+                taps_static = false;
+            }
         }
 
     }
@@ -2573,11 +2631,28 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
                 ev.pos_end = -1;
                 ggml_backend_event_record(ev.event, accum_backend);
                 ev.pos_end = ubatch.pos[0] + (llama_pos) n_tokens;
+                if (taps_static) {
+                    tap_readback_event   = ev.event;
+                    tap_readback_backend = accum_backend;
+                }
             }
         }
 
+        // Two different hazards, two different bounds.
+        //
+        // An in-arena tap reads the scheduler's rotating compute buffers, which
+        // wrap every n_copies ubatches - bounding in-flight extracts to the ring
+        // size is the right guard and it stays.
+        //
+        // A persistent tap (layer_inp_dev) holds a SINGLE ubatch, so the correct
+        // bound is one, not n_copies: ubatch i+1 can overwrite the slot while
+        // ubatch i's readback is still draining. That is why output varies run to
+        // run once a drafter is attached while the same model without one is
+        // reproducible. Handle it where it belongs, as a dependency rather than a
+        // stall - the event recorded above is handed to the next graph_compute,
+        // whose copy waits on it on the device.
         const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
-        if (n_copies > 1 && (++layer_inp_accum_ub % n_copies) == 0) {
+        if (!taps_static && n_copies > 1 && (++layer_inp_accum_ub % n_copies) == 0) {
             ggml_backend_sched_synchronize(sched.get());
         }
     }
@@ -2779,6 +2854,16 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    // The layer tap is a single ubatch deep, so this graph's copy into it would
+    // overwrite rows the previous ubatch's D2H may still be reading. Make the
+    // dependency explicit to the device: the tap backend's stream waits for that
+    // readback to retire before this graph's copy runs. Host side is unaffected,
+    // unlike a synchronize, which drains every backend to achieve the same thing.
+    if (tap_readback_event != nullptr && tap_readback_backend != nullptr) {
+        ggml_backend_event_wait(tap_readback_backend, tap_readback_event);
+        tap_readback_event = nullptr;
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -4073,6 +4158,10 @@ const float * llama_get_embeddings_layer_inp_accum(llama_context * ctx, uint32_t
 
 bool llama_layer_inp_accum_wait(llama_context * ctx, llama_pos p_end) {
     return ctx->layer_inp_accum_wait(p_end);
+}
+
+bool llama_layer_inp_accum_ready(llama_context * ctx, llama_pos p_end) {
+    return ctx->layer_inp_accum_ready(p_end);
 }
 
 void llama_set_mtp_prefill_kv_only(llama_context * ctx, bool value) {
