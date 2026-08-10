@@ -5392,6 +5392,7 @@ class GGMLQuantizationType(IntEnum):
     Q4_0_ROCMFP4_FAST = 101  # ROCmFP4 single-scale speed layout
     Q6_0_ROCMFPX      = 102  # ROCmFPx experimental 6-bit UE4M3-scale reference layout
     Q8_0_ROCMFPX      = 103  # ROCmFPx experimental 8-bit UE4M3-scale reference layout
+    Q3_0_ROCMFPX      = 104  # ROCmFPx experimental 3-bit UE4M3-scale reference layout
     Q2_0_ROCMFPX      = 107  # ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
     Q2_0_ROCMFPX_AFFINE = 108  # ROCmFPx experimental 2-bit affine (UE4M3 scale + offset) layout
 
@@ -5455,6 +5456,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q4_0_ROCMFP4_FAST = 103  # ROCmFP4 single-scale speed layout
     MOSTLY_Q6_0_ROCMFPX      = 110  # ROCmFPx experimental 6-bit reference layout
     MOSTLY_Q8_0_ROCMFPX      = 111  # ROCmFPx experimental 8-bit reference layout
+    MOSTLY_Q3_0_ROCMFPX      = 114  # ROCmFPx experimental 3-bit reference layout
     MOSTLY_Q2_0_ROCMFPX      = 112  # ROCmFPx experimental 2-bit S40 codebook layout
     MOSTLY_Q2_0_ROCMFPX_AFFINE = 113  # ROCmFPx experimental 2-bit affine (UE4M3 scale + offset) layout
 
@@ -5598,6 +5600,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 16 + 1),
     GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
     GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
+    GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
 }
 
 
