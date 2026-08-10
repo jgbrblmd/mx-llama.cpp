@@ -1108,6 +1108,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFPX_AFFINE> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
     static constexpr int qk = QK_ROCMFP6;
     static constexpr int qr = QR_ROCMFP6;

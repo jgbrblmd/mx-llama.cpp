@@ -2041,6 +2041,78 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_rocmfpx_fp3(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *) x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q3_0_ROCMFPX, I);
+    int   * x_qs = (int   *) x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    // Same thread layout as Q8_0 dp4a (gfx906): position p of a tile row holds
+    // group p%8 (4 values) of block p/8, so 2*MMQ_TILE_NE_K positions == 8 blocks.
+    constexpr int threads_per_row = 8;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp3 * bxi = (const block_rocmfp3 *) x + kbx0 + i*stride;
+
+        // Unpack one 4-value group per block: position k + kqsx holds block k/QI_ROCMFP3, group kqsx.
+        // Each FP3 block (32 values, QI_ROCMFP3=8 groups of 4) occupies 8 positions.
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#pragma unroll
+        for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
+            x_qs[i*sram_stride + k + kqsx] = rocmfpx_pack4_fp3_device_vec_cuda(bxi + k/QI_ROCMFP3, kqsx * 4);
+        }
+#else
+#pragma unroll
+        for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k + kqsx] = rocmfpx_pack4_fp3_device_vec_cuda(bxi + k/QI_ROCMFP3, kqsx * 4);
+        }
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    // Scale loading: one thread per block (16 blocks for 2*MMQ_TILE_NE_K/QI_ROCMFP3)
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI_ROCMFP3;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp3 * bxi = (const block_rocmfp3 *) x + kbx0 + i*stride + kbxd;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride + 2*kbxd + 0] = ggml_cuda_ue4m3_to_fp32(bxi->e[0]);
+        x_df[i*sram_stride + 2*kbxd + 1] = ggml_cuda_ue4m3_to_fp32(bxi->e[1]);
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 0] = ggml_cuda_ue4m3_to_fp32(bxi->e[0]);
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 1] = ggml_cuda_ue4m3_to_fp32(bxi->e[1]);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_rocmfp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
