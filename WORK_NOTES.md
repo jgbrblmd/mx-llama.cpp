@@ -189,3 +189,30 @@ tokgen3（多步生成监控，支持 special/n_ctx/prompt/kv-override 参数）
 - 融合 MMVQ/MMQ kernel 已就位（affine 内层）；作者还提 LUCE_MMVQ_MAX_NCOLS=4 调优 knob
 - DSpark 投机解码（Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF，Q4RMFP4 denseF16，sha256 48883d35...）可上 ~32 tok/s；draft 校准 4 routed experts（模型默认 6，改 4 可 +36% decode）
 - 作者公开数字 248-253 tok/s prefill 是 gfx1151 专用融合 kernel 测的，MI50 无参考
+
+## 任务五：BigBang-v1（官方 Qwen3.6-35B-A3B Q5_K_M）乱码排查【已修复并验证 2026-08-10】
+
+### 现象
+- bartowski/endless-frontier_BigBang-v1-Q5_K_M.gguf（arch=qwen35moe，官方 stock b10262 量化，无任何自定义类型）
+- llama-server/llama-cli 都能跑（62-72 t/s），但输出乱码（logits 近均匀）：" 0 4.6.0x1178 28 89 325 9 9 9 10 190 19, withiel..."；CPU/GPU 都乱
+- 张量布局：41 层 = 30 SSM 层（attn_qkv/attn_gate/ssm_a/alpha/beta/conv1d/dt/norm/out）+ 10 全注意力层（blk.3/7/.../39 ≡ 3 mod 4）+ blk.40 MTP（Q4_0×11，未加载，无关）
+
+### 根因（GDN v-head 配对约定）
+- 96853db53 把 qwen35moe 默认设为 grouped（v-head h 配对 k-head h/r），只验证过 KAT-Coder（MLX 派生，真 grouped）
+- **官方/stock 管线产物是 tiled**（stock llama.cpp 运行时只用 ggml_repeat_4d，无 grouped 分支；官方转换已重排）→ 无 flag 的官方 qwen35moe 文件全部走错约定 → 乱码
+- 判定方法：`--override-kv qwen35moe.ssm.v_heads_tiled=bool:true` 后 CPU/GPU 输出立即正常
+
+### 修复
+1. `src/models/qwen35moe.cpp`：默认 `ssm_v_heads_tiled = true`（对齐 stock 与 qwen35 dense），注释写明约定来源
+2. `/opt/LLM/hf/kat.sh`（KAT-MLX 无 flag 且为 grouped）：加 `--override-kv qwen35moe.ssm.v_heads_tiled=bool:false`
+3. docker 容器（kat.2/12/123.sh，镜像 mxxm/mx-llama.cpp:gfx906）默认 tiled（老构建），未受影响，未动
+
+### 验证（重建后 llama-completion，HIP_VISIBLE_DEVICES=1）
+- BigBang 默认配置：短 prompt `<think>` 思考正常 ✓；**356-token 长 prompt（chunked GDN 路径）** 预填充 430.9 t/s，输出连贯 ✓
+- KAT-MLX + override（grouped）：思考正常 ✓
+- 修复前对照：默认 grouped 时 BigBang CPU/GPU 全乱码（已完成记录）
+
+### 环境/工具注意
+- 用户 4 卡常驻 Jormungandr server（PID 125710，qwen35 dense）时其他卡基本占满；HIP_VISIBLE_DEVICES=1 单卡可用
+- **llama-cli 的 REPL 在 stdin EOF 后不退出，反而刷屏 "> "**（一次写几百 MB 日志）；验证请用 `llama-completion`（一次性、无 REPL）或重定向到文件
+- HIP 与 rocm-smi 编号顺序相反（见任务四环境坑）
