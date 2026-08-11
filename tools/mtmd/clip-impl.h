@@ -557,13 +557,13 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MIMOVL,            "mimovl"},
     { PROJECTOR_TYPE_MINIMAX_M3,        "minimax_m3"},
     { PROJECTOR_TYPE_GRANITE4_VISION,   "granite4_vision"},
-    { PROJECTOR_TYPE_MIMO_AUDIO,        "mimo_audio"},
-    { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
-    { PROJECTOR_TYPE_QWEN3TTS_SPKENC,   "qwen3tts_spkenc"},
-    { PROJECTOR_TYPE_QWEN3TTS_GEN,      "qwen3tts_gen"},
-    { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
-    { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
-    { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+    { PROJECTOR_TYPE_MIMO_AUDIO,        "mimo_audio" },
+    { PROJECTOR_TYPE_PARAKEET,          "parakeet" },
+    { PROJECTOR_TYPE_QWEN3TTS_SPKENC,   "qwen3tts_spkenc" },
+    { PROJECTOR_TYPE_QWEN3TTS_GEN,      "qwen3tts_gen" },
+    { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc" },
+    { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen" },
+    { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer" },
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
