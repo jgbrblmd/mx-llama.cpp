@@ -5393,6 +5393,8 @@ class GGMLQuantizationType(IntEnum):
     Q6_0_ROCMFPX      = 102  # ROCmFPx experimental 6-bit UE4M3-scale reference layout
     Q8_0_ROCMFPX      = 103  # ROCmFPx experimental 8-bit UE4M3-scale reference layout
     Q3_0_ROCMFPX      = 104  # ROCmFPx experimental 3-bit UE4M3-scale reference layout
+    Q3_1_ROCMFP3_MIX  = 105  # per-expert mixed absmax/adaptive ROCmFP3; codebook in GGUF KV
+    Q2_1_ROCMFP2_MIX  = 106  # per-expert mixed absmax/adaptive ROCmFP2; codebook in sidecar
     Q2_0_ROCMFPX      = 107  # ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
     Q2_0_ROCMFPX_AFFINE = 108  # ROCmFPx experimental 2-bit affine (UE4M3 scale + offset) layout
 
@@ -5601,6 +5603,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
     GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
     GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
+    GGMLQuantizationType.Q3_1_ROCMFP3_MIX:  (32, 12 + 2),  # same block wire as Q3_0_ROCMFPX
+    GGMLQuantizationType.Q2_1_ROCMFP2_MIX:  (32, 8 + 2),   # same block wire as Q2_0_ROCMFPX
 }
 
 

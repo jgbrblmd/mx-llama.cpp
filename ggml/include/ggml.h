@@ -436,9 +436,11 @@ extern "C" {
         GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
         GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
         GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+        GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3; codebook in GGUF KV
+        GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2; codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx 2-bit S40 codebook (per-half UE4M3 scales) layout
         GGML_TYPE_Q2_0_ROCMFPX_AFFINE = 108, // ROCmFPx 2-bit affine (UE4M3 scale + offset) layout
-        GGML_TYPE_COUNT   = 109,
+        GGML_TYPE_COUNT   = 111,
     };
 
     // precision

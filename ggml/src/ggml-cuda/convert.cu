@@ -1,5 +1,7 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "rocmfp2_mix.cuh"
+#include "rocmfp3_mix.cuh"
 
 #include <cstdint>
 
@@ -659,6 +661,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
             return dequantize_row_rocmfp4_fast_cuda;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+            return dequantize_rocmfp3_mix_to_fp16_cuda;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            return dequantize_rocmfp2_mix_to_fp16_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -722,6 +728,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
             return dequantize_row_rocmfp4_fast_cuda;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+            return dequantize_rocmfp3_mix_to_fp32_cuda;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            return dequantize_rocmfp2_mix_to_fp32_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

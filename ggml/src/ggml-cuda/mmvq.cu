@@ -165,6 +165,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_Q3_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 4;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -186,6 +192,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
         case GGML_TYPE_Q3_0_ROCMFPX:    return 7;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 7;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 7;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -214,6 +226,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type t
         case GGML_TYPE_Q3_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q6_0_ROCMFPX:    return 4;
         case GGML_TYPE_Q8_0_ROCMFPX:    return 4;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -225,6 +243,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_cdna(ggml_type 
         case GGML_TYPE_IQ2_XXS: return 5;
         case GGML_TYPE_IQ3_S:   return 4;
         case GGML_TYPE_IQ3_XXS: return 5;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -241,6 +265,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna1_rdna2(ggm
         case GGML_TYPE_Q4_K:    return 5;
         case GGML_TYPE_Q5_K:    return 6;
         case GGML_TYPE_Q6_K:    return 5;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -259,6 +289,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         case GGML_TYPE_Q4_K:    return 4;
         case GGML_TYPE_Q5_K:    return 4;
         case GGML_TYPE_Q6_K:    return 4;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -288,6 +324,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_Q5_K:    return 5;
         case GGML_TYPE_Q6_K:    return 5;
         case GGML_TYPE_Q8_0:    return 7;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            // mix qtypes have no MMVQ kernel: their per-expert codebook lives in
+            // the side registry the block-local quant kernels can't reach. 0 =
+            // never route them through the vec path.
+            return 0;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }

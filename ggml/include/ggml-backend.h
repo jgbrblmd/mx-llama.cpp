@@ -34,6 +34,7 @@ extern "C" {
     // Backend buffer type
     //
 
+    GGML_API bool                  ggml_backend_buft_is_meta       (ggml_backend_buffer_type_t buft);
     GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
     GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
@@ -423,6 +424,13 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, size_t tps,
         ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // per-device slice of a tensor allocated in a meta buffer (index = simple device
+    // index). Used e.g. by the model loader to register per-device side-data for
+    // tensors whose compute depends on out-of-band buffers (rocmfpX mix qtypes).
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(
+        const struct ggml_tensor * tensor, size_t index);
+    GGML_API size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t buffer);
 
     //
     // Utils

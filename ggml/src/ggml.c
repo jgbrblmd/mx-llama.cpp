@@ -605,6 +605,22 @@ static wchar_t * ggml_mbstowcs(const char * mbs) {
 }
 #endif
 
+// The mix qtypes (105/106) cannot be CPU-dequantized: their per-expert codebook
+// is out-of-band (GGUF KV / sidecar), so a fixed-level fallback here would be
+// silently wrong for adaptive experts. The GPU decode path (registry-aware
+// mul_mat_id / to_fp16 shim) is the only supported decode.
+static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: generic CPU dequantization is unsupported -- the per-expert "
+               "codebook is out-of-band. Use the CUDA/HIP mix path (mul_mat_id or the "
+               "registry-aware to_fp16 shim).");
+}
+static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
+               "sidecar/KV. Produce these tensors with the geo-quant exporter.");
+}
+
 FILE * ggml_fopen(const char * fname, const char * mode) {
 #ifdef _WIN32
     FILE * file = NULL;
@@ -813,6 +829,33 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_rocmfpx_fp3,
         .from_float_ref           = (ggml_from_float_t) quantize_row_rocmfpx_fp3_ref,
+    },
+    [GGML_TYPE_Q3_1_ROCMFP3_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP3. Same 14B block wire as
+        // q3_0; the per-expert codebook lives in GGUF KV and decode happens in
+        // the dedicated CUDA/HIP mul_mat_id path. The generic to_float/
+        // from_float_ref ABORT: a fixed-level fallback here would be silently
+        // wrong for adaptive experts.
+        .type_name                = "q3_1_rocmfp3_mix",
+        .blck_size                = QK_ROCMFP3,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
+    },
+    [GGML_TYPE_Q2_1_ROCMFP2_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP2. Same 10B block wire as
+        // q2_0, so a GGUF splice from 107 is offset-preserving; the per-expert
+        // codebook travels in the loader sidecar and decode happens in the
+        // dedicated CUDA/HIP mul_mat_id path. The generic to_float/
+        // from_float_ref ABORT: a fixed-level fallback here would be silently
+        // wrong for adaptive experts.
+        .type_name                = "q2_1_rocmfp2_mix",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
     },
     [GGML_TYPE_Q6_0_ROCMFPX] = {
         .type_name                = "rocmfp6",
@@ -8066,6 +8109,14 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q6_0_ROCMFPX: result = rocmfpx_quantize_fp6(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0_ROCMFPX: result = rocmfpx_quantize_fp8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_0_ROCMFPX: result = rocmfpx_quantize_fp3(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
+            // Producing these needs a fitted per-expert codebook + sidecar/KV;
+            // ggml_quantize_chunk has no such context, so refuse loudly.
+            GGML_UNUSED(src); GGML_UNUSED(dst); GGML_UNUSED(nrows); GGML_UNUSED(n_per_row); GGML_UNUSED(imatrix);
+            GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and "
+                       "its sidecar/KV (see the geo-quant exporter).");
+        } break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
