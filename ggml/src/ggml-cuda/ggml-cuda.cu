@@ -34,6 +34,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/rocmfp2_mix.cuh"
+#include "ggml-cuda/rocmfp3_mix.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -2337,8 +2339,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
+    // The mix qtypes (105/106) have no MMVQ kernel (per-expert codebook is in the
+    // side registry); fusing them into a mul_mat_vec_q launch would hit a null
+    // vec_dot. The registry-aware mix matvec paths handle them instead.
+    const bool is_mix_qtype = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                           || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && !is_mix_qtype;
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2494,11 +2502,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    // Mix qtypes (105/106) have no MMQ/MMVQ kernels: their per-expert codebook
+    // lives in an out-of-band registry the block-local quant kernels can't reach.
+    // Force them onto the dequantize->cuBLAS path, whose to_fp16/fp32 converters
+    // consult that registry. This also catches the mul_mat_id per-expert
+    // fallback, which re-enters ggml_cuda_mul_mat with 105/106 slices.
+    const bool is_mix_qtype = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                           || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_mix_qtype) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) && !is_mix_qtype) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2521,6 +2536,41 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // ---- DeepSeek4 mix qtypes (105/106) ----
+    // Their learned per-expert codebooks live in a side registry the mmvq/mmq
+    // kernels know nothing about, so those paths must never see them
+    // (get_mmvq_mmid_max_batch returns 0 for them). The registry-aware fused
+    // matvec handles the strict single-token decode case with the routing ids
+    // read on device -- no host id-sort + cudaStreamSynchronize, so the decode
+    // FFN subgraph stays CUDA-graph capturable. Bit-identical per output element
+    // to the generic fallback's per-expert-slice path. Larger batches (prefill)
+    // fall through to the dequant->cuBLAS fallback, whose to_fp16/fp32 shims
+    // consult the same registry.
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne12 == 1) {
+        if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                && ggml_cuda_rocmfp3_mix_mul_mat_id(
+                    src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                    (int) ne12, (int) ne11,
+                    (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                    (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                    (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                    ctx.stream())) {
+            return;
+        }
+        if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+                && ggml_cuda_rocmfp2_mix_mul_mat_id(
+                    src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                    (int) ne12, (int) ne11,
+                    (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                    (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                    (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                    ctx.stream())) {
+            return;
+        }
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3346,7 +3396,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            // Each mix qtype has its OWN registry; querying the 105 one for a 106
+            // node always answers false, so dispatch on the type -- matching the
+            // runtime gate in ggml_cuda_mul_mat_id exactly.
+            const bool is_mmid_105 = node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+            const bool is_mmid_106 = node->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+            const bool mmid_rocmfp_mix_ok =
+                (is_mmid_105 || is_mmid_106) &&
+                node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                node->src[1]->ne[2] == 1 &&
+                (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
+                             : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
+            if ((!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max)
+                    && !mmid_rocmfp_mix_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -5827,6 +5889,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0_ROCMFPX:
                     case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
                     case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+                    case GGML_TYPE_Q2_1_ROCMFP2_MIX:
                     case GGML_TYPE_Q6_0_ROCMFPX:
                     case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_Q2_K:
