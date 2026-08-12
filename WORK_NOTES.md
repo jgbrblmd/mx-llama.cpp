@@ -252,3 +252,8 @@ tokgen3（多步生成监控，支持 special/n_ctx/prompt/kv-override 参数）
 - fused GLU（gate/up+SwiGLU 一次 launch）未接线：我们图是 clamp+SWIGLU 节点序列，Lucebox 用 GGML_GLU_OP_SWIGLU_DS4（op_params 带 limit）；想提速 decode 可后续在调度层加
 - 2D mix matvec/3D slice 钩子未接（本模型 mix 只出现在 mul_mat_id）；dense mix 模型（如 attn_output_a 为 106）需要时再补
 - llama-cli REPL 会刷屏 "> "（既有坑），验证用 llama-server 或重定向
+
+### 追加：fused GLU 接线（2026-08-12，随任务六提交）
+- decode FFN 段实测为 `{MUL_MAT_ID(up), CLAMP(up), MUL_MAT_ID(gate), CLAMP(gate), SWIGLU}`（模型无 exps bias，limit 来自 swiglu_clamp_exp 的 clamp 节点 op_params）
+- 在 ggml_cuda_try_fuse 加 mix 专属融合分支：5 节点折叠为一次 ggml_cuda_rocmfpX_mix_mul_mat_id_glu（同一内核模板 <true> 变体，bit-identical），limit 从 up clamp 的 max 取，仅单 token decode（ne12==1 与 unfused 钩子门一致），内核拒绝（未注册）时回落 unfused
+- 实测（4 卡 -sm tensor，server）：25.07 t/s vs unfused 25.88 t/s —— 提升 ~0-3%，DISABLE_FUSION=1 更慢确认路径生效；瓶颈在 mix matvec 权重读本身而非 launch 数
