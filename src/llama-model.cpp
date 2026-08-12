@@ -361,6 +361,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    // Shared-expert split, see LLAMA_SHEXP_SPLIT below
+    static const std::regex pattern_ffn_up_shexp    ("blk\\.\\d*\\.ffn_(up|gate)_shexp.weight");
+    static const std::regex pattern_ffn_down_shexp  ("blk\\.\\d*\\.ffn_down_shexp.weight");
+
     // MLA (deepseek) design-B head-split routing, see head_split_attention below
     static const std::regex pattern_mla_q_b         ("blk\\.\\d*\\.attn_q_b.weight");
     static const std::regex pattern_mla_out_a       ("blk\\.\\d*\\.attn_output_a.weight");
@@ -587,6 +591,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // Both keep the design-A mirror below.
             // everything else attention-side (indexer, hyper-connection, compressor,
             // KV cache) keeps the design-A mirror below
+        }
+        // Split the shared expert like a dense FFN (up/gate column-parallel, down
+        // row-parallel) instead of mirroring it. Its PARTIAL output merges into the
+        // ggml_add with the routed experts' PARTIAL, so the reduction rides the
+        // existing per-layer AllReduce - no extra communication. At decode the
+        // mirrored shexp read equals the whole routed-expert read (both ~27 MB per
+        // layer on DSV4-Flash), so the mirror is the bulk of the non-scaling lane
+        // traffic. On by default, LLAMA_SHEXP_SPLIT=0 opts out.
+        static const bool shexp_split_env = [] {
+            const char * s = getenv("LLAMA_SHEXP_SPLIT");
+            const bool on = s == nullptr || atoi(s) != 0;
+            if (on) {
+                fprintf(stderr, "[shexp-split] splitting shared experts across the TP group (LLAMA_SHEXP_SPLIT=0 to disable)\n");
+            } else {
+                fprintf(stderr, "[shexp-split] LLAMA_SHEXP_SPLIT=0: shared experts stay mirrored\n");
+            }
+            return on;
+        }();
+        if (shexp_split_env) {
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
         }
         if (replicate_attention) {
             // split only the FFN/experts and the output projection, mirror all the rest

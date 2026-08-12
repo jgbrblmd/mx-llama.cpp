@@ -67,6 +67,21 @@ the fused scores are AllReduce outputs and already bit-identical on every lane.
 Byte-deterministic over a 100k-token greedy run, perplexity consistent with
 `-sm layer` within 0.3%. Works with multi-stage `-tps`. Validated on gfx906.
 
+## Shared-expert tensor-parallel split
+
+Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the
+whole ~27 MB/layer Q8_0 shexp each token, equal to the entire routed-expert
+read, which is split. The shared expert now routes column-parallel (up/gate)
+and row-parallel (down), and the scheduler folds the resulting partial sum into
+the ADD that already feeds the per-layer AllReduce, so the reduction adds no
+communication and the subgraph count is unchanged. Measured on
+DeepSeek-V4-Flash MXFP4 over 8x MI50, 16k prompt: prefill +4-10% in all tensor
+configurations, generation +9-15% at `-tps 8` with a draft model and +5% at
+`-tps 4` without one; `-tps 4` with a draft pays about 2%. On by default;
+`LLAMA_SHEXP_SPLIT=0` restores the mirrored layout. Perplexity shift is
+summation-order class (4.0865 vs 4.0800). A DeepSeek-backbone draft model takes
+the same routing. Validated on gfx906.
+
 ## DSpark drafter under tensor parallelism
 
 The DSpark drafter runs an in-graph argmax over the full vocabulary on logits it

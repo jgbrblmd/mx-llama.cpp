@@ -2925,7 +2925,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
 
-                const int i_delayed = bcast_close ? i : get_i_delayed(i);
+                int i_delayed = bcast_close ? i : get_i_delayed(i);
+
+                // Fold this reduce into a following ADD of two partial sums: the
+                // lane-local ADD of partials is itself a partial of the total, so
+                // the ADD closes with ONE AllReduce covering both operands. The
+                // other operand's producer chain sits between the delayed node and
+                // the ADD and is absorbed into this subgraph - it computes
+                // lane-locally. Without this, splitting the shared expert closes
+                // two AllReduces per layer (routed experts, then the ADD).
+                if (ar_close && !bcast_close) {
+                    ggml_tensor * dnode = cgraph->nodes[i_delayed];
+                    if (ggml_node_get_use_count(cgraph, i_delayed) == 1) {
+                        for (int k = i_delayed + 1; k < cgraph->n_nodes; k++) {
+                            ggml_tensor * cons = cgraph->nodes[k];
+                            bool uses = false;
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                uses = uses || cons->src[s] == dnode;
+                            }
+                            if (!uses) {
+                                continue;
+                            }
+                            if (cons->op == GGML_OP_ADD) {
+                                ggml_tensor * other = cons->src[0] == dnode ? cons->src[1] : cons->src[0];
+                                if (other != nullptr &&
+                                        ggml_backend_meta_get_split_state(other, false).axis ==
+                                        GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                    i_delayed = k;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
