@@ -216,3 +216,39 @@ tokgen3（多步生成监控，支持 special/n_ctx/prompt/kv-override 参数）
 - 用户 4 卡常驻 Jormungandr server（PID 125710，qwen35 dense）时其他卡基本占满；HIP_VISIBLE_DEVICES=1 单卡可用
 - **llama-cli 的 REPL 在 stdin EOF 后不退出，反而刷屏 "> "**（一次写几百 MB 日志）；验证请用 `llama-completion`（一次性、无 REPL）或重定向到文件
 - HIP 与 rocm-smi 编号顺序相反（见任务四环境坑）
+
+## 任务六：DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX（qtype 105/106 mix）移植【已完成并验证 2026-08-12】
+
+### 现象
+- Lucebox 出品 DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf（98.3 GB，4 卡 -sm tensor）加载即崩：
+  `tensor 'blk.0.ffn_down_exps.weight' of type 106 ((null)) has 2048 elements per row, not a multiple of block size (0)`
+- 文件 dtype 分布：Q4_0_ROCMFP4_FAST(101)×660 + F32×535 + Q2_1_ROCMFP2_MIX(106)×101（gate/up 43×2 + down 15）+ Q3_1_ROCMFP3_MIX(105)×28（down）+ Q6_K×1 + I32×3
+
+### 关键事实
+- Lucebox 枚举：105/106 = mix 张量类型（我们的 ftype 105/106 是 ggml_ftype，不同 namespace 不冲突）；我们 ggml_type 枚举 104→107 之间正好是空位 → 原位注册 105/106，COUNT 109→111，无需 120/121 重映射
+- **block 线格式与现有类型相同**：106 = block_rocmfp2（10B，8B 2bit codes + 2B UE4M3 scale），105 = block_rocmfp3（14B）—— 但解码不同：
+  - mode 0（固定）：value = ue4m3(scale) × (code-1)，code∈{0..3} → 水平 {-1,0,1,2}（≠ Q2_0_ROCMFPX 的 MORD {-4,-1,1,4}！）
+  - mode 1（自适应 7s1c）：scale = ue4m3(meta&0x7F)，meta>>7 选 2 本 codebook 之一，value = scale × book[code]
+- **codebook 带外存储**：GGUF KV `deepseek4.gumix.sidecar`（GUMIXs1，106 的 gate/up/down，hdr 7×u32{layer,surface,E,odim,idim,C=2,K=4} + modes(E) + books(E*2*4×2B)）与 `deepseek4.p4mix.sidecar`（P4MIXv1，105 down，hdr 6×u32{layer,E,odim,idim,C=2,K=8} + modes(E)+rots(E)+books(E*2*8×2B)）—— 不是 .bin 文件，元数据内嵌
+- 内核来源：GeometricAGI/lucebox-hub branch feat/qtype106-down-surface（server/deps/llama.cpp 内嵌 fork），registry 按 base 指针范围查找
+
+### 改动清单（10 改 + 4 新文件）
+1. ggml.h：enum 加 GGML_TYPE_Q3_1_ROCMFP3_MIX=105 / Q2_1_ROCMFP2_MIX=106，COUNT=111
+2. ggml.c：traits（blck=32/32, size=14/10, is_quantized=true, to_float/from_float=abort shim）+ quantize_chunk abort
+3. ggml-cuda/rocmfp2_mix.{cu,cuh} + rocmfp3_mix.{cu,cuh}：从 lucebox 复制，适配：register/register_host 加 int device 参数（多卡 cudaSetDevice + entry 记录 device 供 free），新增 to_fp32 dequant 变体（gfx906 无 fast fp16，cuBLAS fallback 走 F32 compute）
+4. unary.cuh：加 ggml_cuda_op_swiglu_ds4_single（fused GLU 内核用；我们图是 clamp 节点+SWIGLU，fused 路径未接线）
+5. convert.cu：to_fp16/to_fp32 注册 mix dequant
+6. mmvq.cu：全部 7 个 get_mmvq_mmid_max_batch 变体 105/106 → 0（禁 mmvq）
+7. ggml-cuda.cu：mul_mat_id 顶部加 mix 钩子（ne12==1 decode，registry 内 read-ids 无 sync）；2D mul_mat 的 mmvq/mmq 加 !is_mix_qtype 护栏；should_fuse_mul_mat_vec_q 排除 mix（否则 fused vec_dot 空指针）；graph check 加 mmid_rocmfp_mix_ok；supports_op 的 MUL_MAT/MUL_MAT_ID 白名单加 105/106（**缺这个张量会落 CPU_Mapped！**）
+8. ggml-backend.h/meta.cpp：暴露 ggml_backend_meta_buffer_simple_tensor / n_bufs / buft_is_meta（加载器注册 per-device slice 需要）
+9. llama-model.cpp：llama_model_register_mix_sidecars()——load_tensors 末尾（load_all_data 之后）解析 GGUF KV sidecar，按 (layer, surface) 匹配张量，meta 模式逐 device slice 注册（axis-1/axis-0 split 下每卡 E=256 全量、nb02 不变、ids 全局可直用）；GGML_DEBUG_MIX_REG=1 可打印注册详情
+10. gguf-py constants：enum + GGML_QUANT_SIZES (32,14)/(32,10)
+
+### 验证（deepseek.sh 原样，4 卡 -sm tensor）
+- 加载成功，webui 对话正常；decode 25.9 t/s（963 tokens 实测），prefill 12 t/s@27tok
+- 已知警告：`internal AllReduce init failed (n_devices != 2?)` 回落 butterfly（既有 4 卡限制，不影响）；compute buffer 首分配 OOM 后自动重试成功（VRAM 紧张）
+
+### 遗留/注意
+- fused GLU（gate/up+SwiGLU 一次 launch）未接线：我们图是 clamp+SWIGLU 节点序列，Lucebox 用 GGML_GLU_OP_SWIGLU_DS4（op_params 带 limit）；想提速 decode 可后续在调度层加
+- 2D mix matvec/3D slice 钩子未接（本模型 mix 只出现在 mul_mat_id）；dense mix 模型（如 attn_output_a 为 106）需要时再补
+- llama-cli REPL 会刷屏 "> "（既有坑），验证用 llama-server 或重定向
