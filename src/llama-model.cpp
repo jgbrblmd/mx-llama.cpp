@@ -20,6 +20,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -1552,6 +1553,273 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// ── DeepSeek4 mix-qtype sidecar registration ──────────────────────────────────
+// The mix qtypes (105/106) decode per-expert weights through a per-expert
+// learned codebook that travels OUT-OF-BAND. This artifact embeds it in the
+// GGUF KV as "deepseek4.gumix.sidecar" (GUMIXs1, qtype-106 gate/up/down) and
+// "deepseek4.p4mix.sidecar" (P4MIXv1, qtype-105 down experts). After all
+// weights are uploaded we register each resident mix tensor's device base +
+// per-expert codebooks/modes with the CUDA/HIP registry so the mul_mat_id
+// decode path and the to_fp16/fp32 fallbacks can resolve them. Port of the
+// Lucebox dflash loader's ds4_register_{gumix,p4mix}_sidecar, with the sidecar
+// read from GGUF KV instead of a sidecar .bin file.
+extern "C" void ggml_cuda_rocmfp2_mix_register_host(
+        const void * base, size_t nb02, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host,
+        const uint8_t * rotations_host, int device);
+extern "C" void ggml_cuda_rocmfp3_mix_register_host(
+        const void * base, size_t nb02, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host,
+        const uint8_t * rotations_host, int device);
+
+// backend-reg index of a device == its CUDA/HIP device ordinal for the CUDA
+// backend (devices are registered in ordinal order).
+static int llama_cuda_dev_index(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return -1;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+struct llama_mix_sidecar_entry {
+    int layer;
+    int surface; // gumix: 0=gate 1=up 2=down; p4mix: -1 (down only)
+    int E, odim, idim;
+    int C, K;
+    std::vector<uint8_t>  modes; // E bytes: 0 = fixed levels, 1 = adaptive 7s1c
+    std::vector<uint8_t>  rots;  // E bytes (p4mix only; must all be 0)
+    std::vector<uint16_t> books; // E*C*K bf16 levels
+};
+
+// Parse one embedded sidecar KV blob. Returns false on a structurally corrupt
+// blob (bad magic, truncated entry, out-of-range dims) so the load fails
+// rather than silently mis-registering.
+static bool llama_model_parse_mix_sidecar(const gguf_context * gguf, const char * key,
+                                          std::vector<llama_mix_sidecar_entry> & out) {
+    const int64_t idx = gguf_find_key(gguf, key);
+    if (idx < 0) {
+        return true; // no sidecar in this model -> nothing to register
+    }
+    if (gguf_get_kv_type(gguf, idx) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(gguf, idx) != GGUF_TYPE_UINT8) {
+        LLAMA_LOG_ERROR("%s: %s is not a uint8 array\n", __func__, key);
+        return false;
+    }
+    const size_t n     = gguf_get_arr_n(gguf, idx);
+    const uint8_t * b  = (const uint8_t *) gguf_get_arr_data(gguf, idx);
+    const bool is_gumix = strncmp(key, "deepseek4.gumix", 15) == 0;
+    const uint32_t max_experts = 1u << 16;
+    const uint32_t max_dim     = 1u << 20;
+
+    if (n < 16) {
+        LLAMA_LOG_ERROR("%s: %s too short (%zu bytes)\n", __func__, key, n);
+        return false;
+    }
+    const char * want_magic = is_gumix ? "GUMIXs1\0" : "P4MIXv1\0";
+    if (memcmp(b, want_magic, 8) != 0) {
+        LLAMA_LOG_ERROR("%s: bad %s magic\n", __func__, key);
+        return false;
+    }
+    uint32_t n_entries, reserved;
+    memcpy(&n_entries, b + 8, 4);
+    memcpy(&reserved,  b + 12, 4);
+    (void) reserved;
+
+    size_t off = 16;
+    for (uint32_t i = 0; i < n_entries; ++i) {
+        const size_t hdr_len = is_gumix ? 7u : 6u;
+        if (off + hdr_len*4 > n) {
+            LLAMA_LOG_ERROR("%s: truncated %s entry %u header\n", __func__, key, i);
+            return false;
+        }
+        uint32_t hdr[7];
+        memcpy(hdr, b + off, hdr_len*4);
+        off += hdr_len*4;
+
+        llama_mix_sidecar_entry e;
+        if (is_gumix) {
+            e.layer = (int) hdr[0]; e.surface = (int) hdr[1];
+            e.E = (int) hdr[2]; e.odim = (int) hdr[3]; e.idim = (int) hdr[4];
+            e.C = (int) hdr[5]; e.K = (int) hdr[6];
+        } else {
+            e.layer = (int) hdr[0]; e.surface = -1;
+            e.E = (int) hdr[1]; e.odim = (int) hdr[2]; e.idim = (int) hdr[3];
+            e.C = (int) hdr[4]; e.K = (int) hdr[5];
+        }
+        // structural validation before sizing any allocation
+        if (is_gumix && (e.surface < 0 || e.surface > 2)) {
+            LLAMA_LOG_ERROR("%s: %s entry %u bad surface %d\n", __func__, key, i, e.surface);
+            return false;
+        }
+        if (e.C != 2 || (is_gumix ? e.K != 4 : e.K != 8)) {
+            LLAMA_LOG_ERROR("%s: %s entry %u unexpected C=%d K=%d\n", __func__, key, i, e.C, e.K);
+            return false;
+        }
+        if (e.E <= 0 || (uint32_t) e.E > max_experts ||
+            e.odim <= 0 || (uint32_t) e.odim > max_dim ||
+            e.idim <= 0 || (uint32_t) e.idim > max_dim) {
+            LLAMA_LOG_ERROR("%s: %s entry %u dims out of range: E=%d out=%d in=%d\n",
+                            __func__, key, i, e.E, e.odim, e.idim);
+            return false;
+        }
+        const size_t book_elems = (size_t) e.E * (size_t) (e.C * e.K);
+        const size_t payload = (size_t) e.E * (is_gumix ? 1 : 2) + book_elems * 2;
+        if (off + payload > n) {
+            LLAMA_LOG_ERROR("%s: truncated %s entry %u payload\n", __func__, key, i);
+            return false;
+        }
+        e.modes.assign(b + off, b + off + e.E);
+        off += e.E;
+        if (!is_gumix) {
+            e.rots.assign(b + off, b + off + e.E);
+            off += e.E;
+        }
+        e.books.resize(book_elems);
+        for (size_t k = 0; k < book_elems; ++k) {
+            e.books[k] = (uint16_t) b[off + 2*k] | ((uint16_t) b[off + 2*k + 1] << 8);
+        }
+        off += book_elems * 2;
+        out.push_back(std::move(e));
+    }
+    return true;
+}
+
+// Register one mix tensor (or its per-device meta-buffer slices) with the
+// sidecar's per-expert codebooks/modes. Full-tensor dims must match the
+// sidecar entry; each device slice registers its own local base + full expert
+// count (the meta TP split shards rows/cols, never experts). Returns false on
+// mismatch so the caller can fail the load -- an unregistered mix tensor has no
+// working decode path.
+static bool llama_model_register_mix_tensor(
+        ggml_tensor * t, const llama_mix_sidecar_entry & e, bool is_fp3, const char * what) {
+    if (t == nullptr) {
+        return true; // tensor not resident -> nothing to register
+    }
+    if (t->type != (is_fp3 ? GGML_TYPE_Q3_1_ROCMFP3_MIX : GGML_TYPE_Q2_1_ROCMFP2_MIX)) {
+        return true; // resident tensor is a different qtype -> sidecar entry not for it
+    }
+    if (e.E != t->ne[2] || e.odim != t->ne[1] || e.idim != t->ne[0]) {
+        LLAMA_LOG_ERROR("%s: %s sidecar dim mismatch for %s: sidecar E=%d out=%d in=%d "
+                        "vs tensor ne2=%lld ne1=%lld ne0=%lld\n",
+                        __func__, what, t->name, e.E, e.odim, e.idim,
+                        (long long) t->ne[2], (long long) t->ne[1], (long long) t->ne[0]);
+        return false;
+    }
+    for (size_t x = 0; x < e.modes.size(); ++x) {
+        if (e.modes[x] > 1) {
+            LLAMA_LOG_ERROR("%s: %s expert %zu unsupported mode %u\n", __func__, what, x, e.modes[x]);
+            return false;
+        }
+    }
+    for (uint8_t r : e.rots) {
+        if (r != 0) {
+            LLAMA_LOG_ERROR("%s: %s nonzero rotation %u (rotation not implemented)\n", __func__, what, r);
+            return false;
+        }
+    }
+
+    const auto register_one = [&](ggml_tensor * slice, int device) -> bool {
+        if (getenv("GGML_DEBUG_MIX_REG")) {
+            fprintf(stderr, "[mix-reg] %s slice %s buffer=%s device=%d E=%d out=%d in=%d\n",
+                    what, slice->name,
+                    slice->buffer ? ggml_backend_buffer_name(slice->buffer) : "(null)",
+                    device, (int) slice->ne[2], (int) slice->ne[1], (int) slice->ne[0]);
+        }
+        if (device < 0) {
+            LLAMA_LOG_ERROR("%s: %s slice of %s is not on a CUDA/HIP device (buffer: %s)\n",
+                            __func__, what, t->name,
+                            t->buffer ? ggml_backend_buffer_name(t->buffer) : "(null)");
+            return false;
+        }
+        if (is_fp3) {
+            ggml_cuda_rocmfp3_mix_register_host(
+                slice->data, slice->nb[2], (int) slice->ne[2],
+                (int) slice->ne[1], (int) slice->ne[0],
+                e.books.data(), e.modes.data(), e.rots.empty() ? nullptr : e.rots.data(), device);
+        } else {
+            ggml_cuda_rocmfp2_mix_register_host(
+                slice->data, slice->nb[2], (int) slice->ne[2],
+                (int) slice->ne[1], (int) slice->ne[0],
+                e.books.data(), e.modes.data(), e.rots.empty() ? nullptr : e.rots.data(), device);
+        }
+        return true;
+    };
+
+    if (ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(t->buffer))) {
+        // -sm tensor: the tensor is sharded across the TP group (rows/cols, never
+        // the expert axis), so each device slice carries ALL experts of its range.
+        const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(t->buffer);
+        for (size_t j = 0; j < n_bufs; ++j) {
+            ggml_tensor * slice = ggml_backend_meta_buffer_simple_tensor(t, j);
+            if (slice == nullptr || slice->data == nullptr) {
+                continue; // zero-sized device slice
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(slice->buffer));
+            if (!register_one(slice, llama_cuda_dev_index(dev))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return register_one(t, llama_cuda_dev_index(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer))));
+}
+
+static bool llama_model_register_mix_sidecars(llama_model_loader & ml, llama_model & model) {
+    int n_fp2 = 0, n_fp3 = 0;
+    // qtype-106 gate/up/down (gumix)
+    std::vector<llama_mix_sidecar_entry> gumix;
+    if (!llama_model_parse_mix_sidecar(ml.metadata, "deepseek4.gumix.sidecar", gumix)) {
+        return false;
+    }
+    for (const auto & e : gumix) {
+        if (e.layer < 0 || (size_t) e.layer >= model.layers.size()) {
+            continue;
+        }
+        llama_layer & layer = model.layers[e.layer];
+        ggml_tensor * t = e.surface == 0 ? layer.ffn_gate_exps
+                        : e.surface == 1 ? layer.ffn_up_exps
+                                         : layer.ffn_down_exps;
+        if (t != nullptr && !llama_model_register_mix_tensor(t, e, /*is_fp3=*/false, "gumix")) {
+            return false;
+        }
+        if (t != nullptr && t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            n_fp2++;
+        }
+    }
+
+    // qtype-105 down experts (p4mix)
+    std::vector<llama_mix_sidecar_entry> p4mix;
+    if (!llama_model_parse_mix_sidecar(ml.metadata, "deepseek4.p4mix.sidecar", p4mix)) {
+        return false;
+    }
+    for (const auto & e : p4mix) {
+        if (e.layer < 0 || (size_t) e.layer >= model.layers.size()) {
+            continue;
+        }
+        ggml_tensor * t = model.layers[e.layer].ffn_down_exps;
+        if (t != nullptr && !llama_model_register_mix_tensor(t, e, /*is_fp3=*/true, "p4mix")) {
+            return false;
+        }
+        if (t != nullptr && t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            n_fp3++;
+        }
+    }
+    if (n_fp2 > 0 || n_fp3 > 0) {
+        LLAMA_LOG_INFO("%s: registered %d qtype-106 and %d qtype-105 mix expert tensor(s) "
+                       "from GGUF KV sidecars\n", __func__, n_fp2, n_fp3);
+    }
+    return true;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1961,6 +2229,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // Register DeepSeek4 mix-qtype (105/106) sidecar codebooks now that all
+    // weights are uploaded and their device bases are final. Without this the
+    // mix tensors have no working decode path.
+    if (!llama_model_register_mix_sidecars(ml, *this)) {
+        return false;
     }
 
     return true;
