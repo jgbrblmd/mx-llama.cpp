@@ -4480,6 +4480,80 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias_node->src[1];
     };
 
+    // ---- DeepSeek4 mix qtypes (105/106): fused gate/up + clamp + SwiGLU ----
+    // The mix decode FFN is {MUL_MAT_ID(up), CLAMP(up), MUL_MAT_ID(gate),
+    // CLAMP(gate), SWIGLU}: the clamp limits (hparams.swiglu_clamp_exp) are
+    // applied inline by the registry-aware fused kernel, so the whole five-node
+    // subgraph collapses into ONE launch instead of five. Bit-identical to the
+    // unfused sequence -- clamp is min/max and the kernel folds the same
+    // values, and the fused matvec is the SAME kernel template the unfused
+    // mul_mat_id path launches (mix_matvec_rocmfpX_moe_kernel<true> vs
+    // <false>), so every output element is bit-for-bit the same. The kernel
+    // refuses (returns false) unless BOTH expert tensors are registered and
+    // shape-matched, in which case we fall through to the unfused path.
+    // Gated to the strict single-token decode case (n_tokens == 1), matching
+    // the unfused mul_mat_id hook's ne12 == 1 gate.
+    if (i + 5 <= cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i,
+                { GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU },
+                { i + 4 })) {
+        const int mix_glu_out[1] = { i + 4 };
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, mix_glu_out, 1)) {
+            ggml_tensor * up_n    = cgraph->nodes[i];
+            ggml_tensor * up_cl   = cgraph->nodes[i + 1];
+            ggml_tensor * gate_n  = cgraph->nodes[i + 2];
+            ggml_tensor * gate_cl = cgraph->nodes[i + 3];
+            ggml_tensor * glu     = cgraph->nodes[i + 4];
+
+            const bool is_mix = up_n->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                             || up_n->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+            if (is_mix && up_cl->src[0] == up_n && gate_cl->src[0] == gate_n
+                    && glu->src[0] == gate_cl && glu->src[1] == up_cl
+                    && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU
+                    && gate_n->src[0]->type == up_n->src[0]->type
+                    && ggml_are_same_shape(gate_n->src[0], up_n->src[0])
+                    && gate_n->src[1] == up_n->src[1] && gate_n->src[2] == up_n->src[2]
+                    && up_n->src[1]->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
+                    && up_n->src[1]->ne[2] == 1) {
+                const float up_min   = ggml_get_op_params_f32(up_cl, 0);
+                const float up_max   = ggml_get_op_params_f32(up_cl, 1);
+                const float gate_max = ggml_get_op_params_f32(gate_cl, 1);
+                // up clamp is [-limit, limit]; gate clamp is [-inf, limit]
+                if (up_max > 0 && up_min == -up_max && gate_max == up_max) {
+                    const int64_t ids_s0  = (int64_t) (gate_n->src[2]->nb[0] / sizeof(int32_t));
+                    const int64_t ids_s1  = (int64_t) (gate_n->src[2]->nb[1] / sizeof(int32_t));
+                    const int64_t src1_s1 = (int64_t) (up_n->src[1]->nb[1] / sizeof(float));
+                    const int64_t src1_s2 = (int64_t) (up_n->src[1]->nb[2] / sizeof(float));
+                    const int64_t dst_s1  = (int64_t) (glu->nb[1] / sizeof(float));
+                    const int64_t dst_s2  = (int64_t) (glu->nb[2] / sizeof(float));
+                    const int in  = (int) up_n->src[0]->ne[0];
+                    const int out = (int) up_n->src[0]->ne[1];
+                    const int n_expert_used = (int) gate_n->src[2]->ne[0];
+                    const int n_tokens = (int) up_n->src[1]->ne[2];
+                    const int ne11     = (int) up_n->src[1]->ne[1];
+
+                    bool handled = false;
+                    if (up_n->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+                        handled = ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
+                            up_n->src[0]->data, gate_n->src[0]->data,
+                            (const float *) up_n->src[1]->data, (const int32_t *) gate_n->src[2]->data,
+                            (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, up_max, cuda_ctx->stream());
+                    } else {
+                        handled = ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
+                            up_n->src[0]->data, gate_n->src[0]->data,
+                            (const float *) up_n->src[1]->data, (const int32_t *) gate_n->src[2]->data,
+                            (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, up_max, cuda_ctx->stream());
+                    }
+                    if (handled) {
+                        return 4;
+                    }
+                }
+            }
+        }
+    }
+
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
