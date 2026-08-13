@@ -257,3 +257,35 @@ tokgen3（多步生成监控，支持 special/n_ctx/prompt/kv-override 参数）
 - decode FFN 段实测为 `{MUL_MAT_ID(up), CLAMP(up), MUL_MAT_ID(gate), CLAMP(gate), SWIGLU}`（模型无 exps bias，limit 来自 swiglu_clamp_exp 的 clamp 节点 op_params）
 - 在 ggml_cuda_try_fuse 加 mix 专属融合分支：5 节点折叠为一次 ggml_cuda_rocmfpX_mix_mul_mat_id_glu（同一内核模板 <true> 变体，bit-identical），limit 从 up clamp 的 max 取，仅单 token decode（ne12==1 与 unfused 钩子门一致），内核拒绝（未注册）时回落 unfused
 - 实测（4 卡 -sm tensor，server）：25.07 t/s vs unfused 25.88 t/s —— 提升 ~0-3%，DISABLE_FUSION=1 更慢确认路径生效；瓶颈在 mix matvec 权重读本身而非 launch 数
+
+## 任务六追加 2：Lucebox MIX-STRIX 输出退化排查 —— 根因是缺失内嵌 chat template（2026-08-12）
+
+### 现象
+- Lucebox MIX-STRIX（105/106 mix）4 卡 -sm tensor 能加载能输出，但退化：不思考、不用工具、
+  think/模板泄漏（复述 GGUF 模板 JSON）、不在 <|im_end|> 停止而是复述对话历史循环
+- otheru 同架构模型（experts 为 107 S40）同配置正常 → 一度怀疑 105/106 移植有遗漏
+
+### 排查过程（全部排除）
+1. 两模型 GGUF 结构对比：同 43 层、同超参数（含 expert_weights_scale/norm、swiglu_clamp_exp=10、
+   compress_ratios、nextn_predict_layers=0）、同 129 expert 张量，唯一差异 = 105/106 vs 107
+2. 注册验证：GGML_DEBUG_MIX_REG=1 → 129 张量全部注册（4 卡按层分割各注册各自宿主卡）
+3. 数值验证（决定性）：CPU 手写 dequant（按格式规范）vs GPU to_fp32/matvec 逐值对比
+   - 106 blk.0 up：99.956% 完全一致；105 blk.1 down：99.98% 一致（差异均为 CPU 脚本
+     uint32 下溢 bug 与边界元素，GPU 侧正确返回 0）→ dequant 实现与格式理解正确
+4. 路径二分：mix matvec / fused GLU（bc989380f）/ graph / DISABLE_MIX_MATVEC+cuBLAS decode
+   全部输出相同退化 → decode 路径无辜（注：fused GLU 先于用户测试的 13:28 二进制，后编入 14:18）
+5. 数据扫描：无 NaN/Inf/全零块；code 分布、meta bit7 使用率、books 范围均正常
+6. 首 token 测试：max_tokens=1 输出全对（"5"、"Hello"），与 prompt 长度无关 → prefill 正确
+
+### 真正根因
+- **Lucebox GGUF 无 tokenizer.chat_template KV（转换丢失），otheru 有（9282 字符 DSV4 官方
+  think 模板）**。--jinja 无文件时 server fallback 通用默认模板，prompt 格式与 DSV4 训练格式
+  不匹配 → 模型困惑：不 think、不在 <|im_end|>（eos id=1 但实际 im_end 非 EOS）停止、复述历史
+- 验证：--chat-template-file /opt/LLM/hf/dsv4_flash.jinja（自 otheru 提取）后完全正常：
+  reasoning_content 恢复、finish=stop、无循环。105/106 mix 移植本身无 bug
+
+### 改动
+- 新增 /opt/LLM/hf/dsv4_flash.jinja（DSV4 官方模板，提取自 otheru GGUF）
+- deepseek.sh：Lucebox 行加 --chat-template-file /opt/LLM/hf/dsv4_flash.jinja
+- ggml-cuda.cu：保留 GGML_CUDA_DISABLE_MIX_MATVEC=1 调试开关（mix 钩子前 env 检查，
+  强制 decode 走 dequant→cuBLAS，需配合 DISABLE_GRAPHS 否则 stream capture 报错）
