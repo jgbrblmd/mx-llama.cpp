@@ -1032,6 +1032,22 @@ struct ggml_backend_cuda_comm_context {
     };
     // One slot per in-flight scheduler copy. Slots advance per source rank so
     // the required depth is independent of how many stage boundaries exist.
+    // Depth of the per-rank staging ring. Each live slot holds its own staging
+    // buffer (power-of-two rounded, 512 MiB in the DSV4 production config), so
+    // this bounds the resident staging footprint. Runtime-tunable to allow an
+    // A/B against VRAM and throughput; default unchanged.
+    // Ring depth actually used, set from the pipeline depth by the meta backend
+    // (n_stages + 1, enough to keep every stage fed). The slot vectors are always
+    // allocated at the compile-time maximum, so only the rotation modulus changes
+    // and the slots past the depth never receive a buffer.
+    size_t staging_depth = GGML_SCHED_MAX_COPIES;
+
+    size_t xfer_staging_nslots_get() const {
+        size_t n = staging_depth;
+        if (n < 1) n = 1;
+        if (n > (size_t) GGML_SCHED_MAX_COPIES) n = (size_t) GGML_SCHED_MAX_COPIES;
+        return n;
+    }
     static constexpr size_t xfer_staging_nslots = GGML_SCHED_MAX_COPIES;
     std::vector<std::vector<xfer_staging_slot>> xfer_staging;
     std::vector<std::vector<xfer_staging_buffer>> xfer_staging_free;
@@ -1407,6 +1423,18 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 // Init -- chained nccl -> internal -> none.  Each step tries to bring up its
 // resource; on failure it warns and recurses into the next step.
 // ---------------------------------------------------------------------------
+// Fork-local: let the meta backend size the staging ring from the pipeline
+// depth. Optional - if the symbol is not looked up the compile-time default
+// applies, which is the previous behaviour.
+static void ggml_backend_cuda_comm_set_staging_depth(void * comm_ctx_v, size_t depth) {
+    if (comm_ctx_v == nullptr || depth == 0) {
+        return;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    comm_ctx->staging_depth = depth > (size_t) GGML_SCHED_MAX_COPIES
+        ? (size_t) GGML_SCHED_MAX_COPIES : depth;
+}
+
 static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
@@ -1645,7 +1673,7 @@ static bool ggml_backend_cuda_comm_sendrecv_tensor(
         ggml_cuda_set_device(src_ctx->device);
 
         const size_t staging_slot = comm_ctx->xfer_staging_next[rank]++ %
-            ggml_backend_cuda_comm_context::xfer_staging_nslots;
+            comm_ctx->xfer_staging_nslots_get();
         staging_slots[rank] = staging_slot;
         ggml_backend_cuda_comm_context::xfer_staging_slot & slot = comm_ctx->xfer_staging[rank][staging_slot];
         if (slot.done == nullptr) {
@@ -6500,6 +6528,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_token_graph_free;
     }
 #ifdef GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_comm_set_staging_depth") == 0) {
+        return (void *) ggml_backend_cuda_comm_set_staging_depth;
+    }
     if (strcmp(name, "ggml_backend_comm_sendrecv_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_sendrecv_tensor;
     }
