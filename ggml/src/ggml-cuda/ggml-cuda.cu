@@ -2487,7 +2487,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // to the generic fallback's per-expert-slice path. Larger batches (prefill)
     // fall through to the dequant->cuBLAS fallback, whose to_fp16/fp32 shims
     // consult the same registry.
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne12 == 1) {
+    // DEBUG: GGML_CUDA_DISABLE_MIX_MATVEC=1 forces the dequant->cuBLAS fallback
+    // for mix qtypes on decode too, to bisect mix-matvec vs dequant correctness.
+    static const bool mix_matvec_disabled = [] {
+        const char * v = getenv("GGML_CUDA_DISABLE_MIX_MATVEC");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne12 == 1 && !mix_matvec_disabled) {
         if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
                 && ggml_cuda_rocmfp3_mix_mul_mat_id(
                     src0->data, (const float *) src1->data, (const int32_t *) ids->data,
