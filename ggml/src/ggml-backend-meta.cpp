@@ -2033,6 +2033,12 @@ struct ggml_backend_meta_context {
     // raising anything.
     std::unordered_map<const ggml_tensor *, size_t> tensor_stage;
 
+    // Owning stage of each persistent buffer, kept ACROSS graphs. tensor_stage is
+    // cleared per graph, so a graph that only writes a KV buffer (the speculative
+    // K/V injection) has no way to learn which stage that buffer belongs to and
+    // would default to stage 0, writing a copy nobody reads.
+    std::unordered_map<const ggml_tensor *, size_t> persist_buffer_stage;
+
     // Fragment-mode state. A cgraph with uid == 0 is a graph view from the
     // scheduler's eval-callback path: a subrange of one logical graph, computed one
     // call at a time. Stage context and tensor validity then have to survive across
@@ -2909,6 +2915,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            // A graph with no owned node anywhere cannot derive a stage from its
+            // own contents, so every node inherits the walk's initial stage and any
+            // write lands there - which is wrong when the buffer belongs elsewhere.
+            // Only such a graph may fall back to the recorded buffer owner; a graph
+            // that owns nodes already places itself and must not be disturbed.
+            bool graph_has_owner = false;
+            if (backend_ctx->n_stages > 1) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    if (node_owning_stage(cgraph->nodes[i]) >= 0) {
+                        graph_has_owner = true;
+                        break;
+                    }
+                }
+            }
+
             int i_start = 0;
             // Fragments inherit the active stage from the previous fragment.
             int current_stage = fragment ? backend_ctx->frag_last_stage : 0;
@@ -2925,7 +2946,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // Stage detection. A node whose inferred split_state has a clear per-lane
                 // owning stage (i.e., non-zero ne[] only inside one stage's lane range)
                 // determines the active stage going forward. MIRRORED/PARTIAL inherit.
-                const int n_stage = node_owning_stage(node);
+                int n_stage = node_owning_stage(node);
+                if (n_stage < 0 && !graph_has_owner && backend_ctx->n_stages > 1 &&
+                        !backend_ctx->persist_buffer_stage.empty()) {
+                    // No per-lane information, but if this node writes a persistent
+                    // buffer whose owning stage is already known, that stage owns the
+                    // write too - otherwise it lands on a copy its reader never sees.
+                    const ggml_tensor * wr = node;
+                    while (wr != nullptr && wr->view_src != nullptr) {
+                        wr = wr->view_src;
+                    }
+                    if (wr != nullptr) {
+                        const auto it_b = backend_ctx->persist_buffer_stage.find(wr);
+                        if (it_b != backend_ctx->persist_buffer_stage.end()) {
+                            n_stage = (int) it_b->second;
+                        }
+                    }
+                }
                 bool stage_transition = (backend_ctx->n_stages > 1 && n_stage >= 0 && n_stage != current_stage && i > i_start);
                 if (stage_transition) {
                     // Would this seam split a persistent buffer - writes before it,
@@ -2976,6 +3013,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // Record the owning stage so a later MIRRORED read can pick a lane that
                 // actually holds the data instead of a fixed index.
                 backend_ctx->tensor_stage[node] = (size_t) current_stage;
+
+                // Remember which stage owns each persistent buffer this node touches,
+                // so a later graph that only writes it can be placed correctly.
+                if (backend_ctx->n_stages > 1) {
+                    auto proot = [](const ggml_tensor * t) -> const ggml_tensor * {
+                        while (t != nullptr && t->view_src != nullptr) t = t->view_src;
+                        return t;
+                    };
+                    const ggml_tensor * wr = proot(node);
+                    if (wr != nullptr && wr->buffer != nullptr &&
+                            ggml_backend_buffer_get_usage(wr->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                            ggml_backend_buffer_get_usage(wr->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                        backend_ctx->persist_buffer_stage[wr] = (size_t) current_stage;
+                    }
+                }
 
                 const bool ar_close  = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL);
                 // TOP_K selections must be uniform across the stage's lanes: the
