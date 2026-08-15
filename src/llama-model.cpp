@@ -856,9 +856,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
-                // the attention output rows are V-heads x n_head, its slices follow the V cache split,
-                // so the output projection must be split with the same head-V granularity
-                return {std::lcm((int64_t) hparams.n_embd_head_v(il), blck_size_perf)};
+                // The FA output rows follow the Q head partition, and Q is split at GQA-group
+                // granularity (n_gqa heads per unit, see pattern_q_weight above). The output
+                // projection must take one V head per Q head of that same unit, otherwise the
+                // head slices of mul_mat(wo, fa_out) disagree for unbalanced tensor splits
+                // (e.g. --tensor-split 4.5,5.5) and the meta backend aborts.
+                // At symmetric splits n_gqa*n_embd_head_v is a multiple of the old
+                // per-V-head granularity, so 1:1 and 2-way splits are unchanged.
+                return {std::lcm((int64_t) n_gqa * hparams.n_embd_head_v(il), blck_size_perf)};
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
