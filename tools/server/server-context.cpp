@@ -399,14 +399,15 @@ struct server_slot {
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
     }
 
+    // task can be null: a slot whose task was just rejected (e.g. prompt larger
+    // than the context) is released before every path has finished using it -
+    // return false instead of asserting (crashed on oversized web-search replies)
     bool need_embd() const {
-        GGML_ASSERT(task);
-        return task->need_embd() || (spec && common_speculative_need_embd(spec));
+        return task != NULL && (task->need_embd() || (spec && common_speculative_need_embd(spec)));
     }
 
     bool need_embd_nextn() const {
-        GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_nextn(spec);
+        return task != NULL && spec && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
