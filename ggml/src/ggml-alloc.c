@@ -1358,6 +1358,38 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         }
     }
 
+    // a previous failed reserve (e.g. OOM) can leave some buffers NULL while the
+    // node/leaf layout still "fits" - refuse the allocation instead of binding
+    // tensors into a null vbuffer (segfault on a full GPU during prefill)
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const struct tensor_alloc * ta = &galloc->leaf_allocs[i].leaf;
+        if (ta->buffer_id >= 0 && ta->buffer_id < galloc->n_buffers && galloc->buffers[ta->buffer_id] == NULL
+            && ta->addr.chunk >= 0 && ta->addr.offset != SIZE_MAX) {
+            GGML_LOG_ERROR("%s: leaf %d needs unallocated buffer %d (%s), call reserve first\n",
+                    __func__, i, ta->buffer_id, ggml_backend_buft_name(galloc->bufts[ta->buffer_id]));
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct node_alloc * na = &galloc->node_allocs[i];
+        const struct tensor_alloc * ta = &na->dst;
+        if (ta->buffer_id >= 0 && ta->buffer_id < galloc->n_buffers && galloc->buffers[ta->buffer_id] == NULL
+            && ta->addr.chunk >= 0 && ta->addr.offset != SIZE_MAX) {
+            GGML_LOG_ERROR("%s: node %d needs unallocated buffer %d (%s), call reserve first\n",
+                    __func__, i, ta->buffer_id, ggml_backend_buft_name(galloc->bufts[ta->buffer_id]));
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ta = &na->src[j];
+            if (ta->buffer_id >= 0 && ta->buffer_id < galloc->n_buffers && galloc->buffers[ta->buffer_id] == NULL
+                && ta->addr.chunk >= 0 && ta->addr.offset != SIZE_MAX) {
+                GGML_LOG_ERROR("%s: node %d src %d needs unallocated buffer %d (%s), call reserve first\n",
+                        __func__, i, j, ta->buffer_id, ggml_backend_buft_name(galloc->bufts[ta->buffer_id]));
+                return false;
+            }
+        }
+    }
+
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers[i] != NULL) {
