@@ -755,7 +755,8 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         yield from Qwen3NextModel.modify_tensors(self, data_torch, name, bid)
 
 
-@ModelBase.register("DFlashDraftModel")
+@ModelBase.register("DFlashDraftModel", "DFlash2DraftModel")
+@ModelBase.example("z-lab/Qwen3.5-9B-DFlash")
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
@@ -790,9 +791,31 @@ class DFlashModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
-        block_size = self.hparams.get("block_size", 16)
-        self.gguf_writer.add_block_size(block_size)
         dflash_config = self.hparams.get("dflash_config", {})
+        block_size = dflash_config.get("block_size", self.hparams.get("block_size", 16))
+        self.gguf_writer.add_block_size(block_size)
+
+        if "conv_kernel_size" in dflash_config:
+            self.gguf_writer.add_conv_kernel_size(int(dflash_config["conv_kernel_size"]))
+            self.gguf_writer.add_conv_group_size(int(dflash_config["conv_group_size"]))
+            self.gguf_writer.add_selector_rank(int(dflash_config["selector_rank"]))
+            self.gguf_writer.add_selector_top_k(int(dflash_config["selector_top_k"]))
+
+        output_multiplier = dflash_config.get(
+            "output_multiplier", self.hparams.get("output_multiplier")
+        )
+        if output_multiplier is not None:
+            self.gguf_writer.add_logit_scale(float(output_multiplier))
+        softcap = dflash_config.get(
+            "final_logit_softcapping", self.hparams.get("final_logit_softcapping")
+        )
+        if softcap is not None and float(softcap) > 0:
+            self.gguf_writer.add_final_logit_softcapping(float(softcap))
+        embedding_scale = dflash_config.get(
+            "input_embedding_scale", self.hparams.get("input_embedding_scale")
+        )
+        if embedding_scale is not None:
+            self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
@@ -815,7 +838,17 @@ class DFlashModel(Qwen3Model):
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("Qwen3DSparkModel")
+        if name in (
+            "model.candidate_selector.predecessor_codebook",
+            "model.candidate_selector.successor_codebook",
+        ):
+            name += ".weight"
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen3DSparkModel", "DSparkDraftModel", "DSparkSpeculator")
+@ModelBase.example("satgeze/Qwen3.6-27B-DSpark")
 class DSparkModel(DFlashModel):
     # DSpark = DFlash + a semi-autoregressive Markov head
     model_arch = gguf.MODEL_ARCH.DFLASH
