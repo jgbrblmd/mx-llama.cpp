@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import ctypes
 import logging
 import contextlib
 import json
@@ -54,6 +55,33 @@ except ImportError:
 
 logger = logging.getLogger("hf-to-gguf")
 
+
+# ---------------------------------------------------------------------------
+# Direct ROCmFP4 output (--rocmfp4): quantize with the C reference kernels
+# from libggml-base so the byte layout matches the runtime kernels exactly.
+# ---------------------------------------------------------------------------
+_ROCMFP4_LIB = None
+
+# qtype -> (c symbol, out bytes per block, block size)
+_ROCMFP4_REF: dict = {
+    gguf.GGMLQuantizationType.Q4_0_ROCMFP4:      ("rocmfp4_quantize_row_q4_0_ref", 18, 32),
+    gguf.GGMLQuantizationType.Q4_0_ROCMFP4_FAST: ("rocmfp4_quantize_row_q4_0_fast_ref", 17, 32),
+    gguf.GGMLQuantizationType.Q6_K:              ("quantize_row_q6_K_ref", 210, 256),
+}
+
+def _rocmfp4_lib():
+    global _ROCMFP4_LIB
+    if _ROCMFP4_LIB is None:
+        import ctypes
+        here = Path(__file__).resolve().parent.parent
+        for p in [here / "build-hip" / "bin" / "libggml-base.so",
+                  here / "build" / "bin" / "libggml-base.so"]:
+            if p.exists():
+                _ROCMFP4_LIB = ctypes.CDLL(str(p))
+                break
+        if _ROCMFP4_LIB is None:
+            raise RuntimeError("libggml-base.so not found (build the repo first)")
+    return _ROCMFP4_LIB
 
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
 
@@ -124,7 +152,9 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 rocmfp4: bool = False,
+                 quantize_threads: int = 4):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -135,6 +165,14 @@ class ModelBase:
 
         self.dir_model = dir_model
         self.ftype = ftype
+        self._rocmfp4 = rocmfp4
+        self._quantize_threads = quantize_threads
+        if self._rocmfp4:
+            # STRIX recipe (embd Q6_K, attn k/v Q4_0_ROCMFP4, rest FAST).
+            # Use the raw ftype value on purpose: it is not a LlamaFileType
+            # member, so none of the ftype-based dispatch below matches it,
+            # and it is written through to general.file_type as-is.
+            self.ftype = 105  # GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX
         self.fname_out = fname_out
         self.is_big_endian = is_big_endian
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
@@ -654,6 +692,39 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith((".input_scale", ".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
+            elif quant_method == "mxfp4":
+                # MLX-style MXFP4 (e.g. unsloth safetensors exports): e2m1 codes
+                # packed as uint32 (8 values per word, low nibble first, group 32)
+                # with uint8 E8M0 scales (standard bias-127, scale = 2^(e-127)).
+                e2m1_vals = torch.tensor(
+                    (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0), dtype=torch.float32)
+
+                def dequant_mxfp4(weight: Tensor, scale: Tensor) -> Tensor:
+                    weight = LazyTorchTensor.to_eager(weight)
+                    scale = LazyTorchTensor.to_eager(scale)
+                    M, N = weight.shape
+                    # uint32 viewed as uint8 gives the LE byte stream: byte j holds
+                    # values 2j (low nibble) and 2j+1 (high nibble)
+                    w8 = weight.view(torch.uint8).reshape(M, N * 4)
+                    lo = torch.bitwise_and(w8, 0x0F)
+                    hi = torch.bitwise_right_shift(w8, 4)
+                    codes = torch.stack((lo, hi), dim=-1).reshape(M, N * 8).to(torch.int32)
+                    q = e2m1_vals[codes]
+                    d = torch.pow(2.0, scale.to(torch.float32) - 127.0)
+                    d = d.repeat_interleave(q.shape[-1] // d.shape[-1], dim=-1)
+                    return (q * d).to(torch.bfloat16)
+
+                for name in list(self.model_tensors.keys()):
+                    if not name.endswith(".weight"):
+                        continue
+                    scales_name = name.replace(".weight", ".scales")
+                    s = self.model_tensors.get(scales_name)
+                    w = self.model_tensors[name]
+                    if s is None or len(w().shape) != 2:
+                        continue
+                    self.model_tensors[name] = lambda w=w, s=s: dequant_mxfp4(w(), s())
+                    tensors_to_remove.append(scales_name)
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -744,6 +815,53 @@ class ModelBase:
         if self._fp8_as_q8 and name in self._fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0
         return False
+
+    def _rocmfp4_recipe_qtype(self, new_name: str, bid: int | None, data: np.ndarray) -> gguf.GGMLQuantizationType:
+        """STRIX recipe: embd Q6_K, attn k/v Q4_0_ROCMFP4 (2-scale), everything
+        else quantizable Q4_0_ROCMFP4_FAST, the rest F32. Matches the C ftype 105."""
+        n = data.shape[-1] if data.ndim >= 2 else 0
+        if n % 32 != 0:
+            return gguf.GGMLQuantizationType.F32
+        # GDN gating/decay coefficients stay F32 in the STRIX recipe
+        if new_name.endswith(("ssm_alpha.weight", "ssm_beta.weight")):
+            return gguf.GGMLQuantizationType.F32
+        if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.TOKEN_EMBD, bid):
+            return gguf.GGMLQuantizationType.Q6_K if n % 256 == 0 else gguf.GGMLQuantizationType.F32
+        if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.OUTPUT, bid):
+            return gguf.GGMLQuantizationType.Q4_0_ROCMFP4_FAST
+        if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_K, bid) or \
+           self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_V, bid):
+            return gguf.GGMLQuantizationType.Q4_0_ROCMFP4
+        return gguf.GGMLQuantizationType.Q4_0_ROCMFP4_FAST
+
+    def _quantize_rocmfp4(self, data: np.ndarray, qtype: gguf.GGMLQuantizationType) -> np.ndarray:
+        """Quantize a flat f32 tensor with the C reference kernels (threads release
+        the GIL, so block-aligned chunks of the flattened row run in parallel).
+        Returns uint8 bytes shaped [n_rows, n_cols*row_bytes/blk] (numpy order)."""
+        sym, row_bytes, blk = _ROCMFP4_REF[qtype]
+        flat = np.ascontiguousarray(data.reshape(-1), dtype=np.float32)
+        if flat.size % blk:
+            raise ValueError(f"rocmfp4: {flat.size} values not a multiple of block {blk}")
+        fn = getattr(_rocmfp4_lib(), sym)
+        fn.restype = None
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong]
+        out = np.empty(flat.size // blk * row_bytes, dtype=np.uint8)
+        n_blk = flat.size // blk
+        if self._quantize_threads <= 1 or n_blk <= 2 * self._quantize_threads:
+            fn(flat.ctypes.data, out.ctypes.data, flat.size)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            chunk = (n_blk + self._quantize_threads - 1) // self._quantize_threads
+            futs = []
+            with ThreadPoolExecutor(max_workers=self._quantize_threads) as pool:
+                for i in range(0, n_blk, chunk):
+                    j = min(i + chunk, n_blk)
+                    # pointer math is in bytes (blk is in elements, flat is f32)
+                    futs.append(pool.submit(fn, flat.ctypes.data + i * blk * flat.itemsize,
+                                            out.ctypes.data + i * row_bytes, (j - i) * blk))
+                for f in futs:
+                    f.result()
+        return out.reshape((data.shape[0], -1))
 
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
@@ -885,7 +1003,8 @@ class ModelBase:
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
         quant_algo = quantization_config.get("quant_algo")
-        quant_method = quantization_config.get("quant_method")
+        # MLX-style configs (unsloth exports) spell the method as "mode"
+        quant_method = quantization_config.get("quant_method") or quantization_config.get("mode")
         quant_format = quantization_config.get("format")
         quant_groups = quantization_config.get("config_groups") or {}
         quant_layers = quantization_config.get("quantized_layers") or {}
@@ -1045,7 +1164,13 @@ class ModelBase:
 
                 # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if isinstance(data_qtype, bool):
-                    if self.ftype == gguf.LlamaFileType.ALL_F32:
+                    if self._rocmfp4:
+                        data_qtype = self._rocmfp4_recipe_qtype(new_name, bid, data)
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4_MOE:
+                        # MXFP4 source: re-pack natively to the GGML MXFP4 type
+                        # instead of dequantizing to 16-bit
+                        data_qtype = gguf.GGMLQuantizationType.MXFP4
+                    elif self.ftype == gguf.LlamaFileType.ALL_F32:
                         data_qtype = gguf.GGMLQuantizationType.F32
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
                         data_qtype = gguf.GGMLQuantizationType.F16
@@ -1060,12 +1185,17 @@ class ModelBase:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
-                try:
-                    data = gguf.quants.quantize(data, data_qtype)
-                except gguf.QuantError as e:
-                    logger.warning("%s, %s", e, "falling back to F16")
-                    data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                if data_qtype in _ROCMFP4_REF:
+                    # only reachable in --rocmfp4 mode; the C reference kernels
+                    # define the exact scale computation the runtime kernels expect
+                    data = self._quantize_rocmfp4(data, data_qtype)
+                else:
+                    try:
+                        data = gguf.quants.quantize(data, data_qtype)
+                    except gguf.QuantError as e:
+                        logger.warning("%s, %s", e, "falling back to F16")
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                        data = gguf.quants.quantize(data, data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -1266,7 +1396,10 @@ class TextModel(ModelBase):
 
         total_params = self.gguf_writer.get_total_parameter_count()[0]
         # Extract the encoding scheme from the file type name. e.g. 'gguf.LlamaFileType.MOSTLY_Q8_0' --> 'Q8_0'
-        output_type: str = self.ftype.name.partition("_")[2]
+        if self._rocmfp4:
+            output_type = "ROCMFP4"  # ftype is the raw int 105 here
+        else:
+            output_type: str = self.ftype.name.partition("_")[2]
 
         # Filename Output
         if self.fname_out.is_dir():
@@ -2517,7 +2650,10 @@ class MmprojModel(ModelBase):
     def prepare_metadata(self, vocab_only: bool):
         super().prepare_metadata(vocab_only=vocab_only)
 
-        output_type: str = self.ftype.name.partition("_")[2]
+        if self._rocmfp4:
+            output_type = "ROCMFP4"  # ftype is the raw int 105 here
+        else:
+            output_type: str = self.ftype.name.partition("_")[2]
 
         if self.fname_out.is_dir():
             fname_default: str = gguf.naming_convention(self.metadata.name, self.metadata.basename, self.metadata.finetune, self.metadata.version, size_label=None, output_type=output_type, model_type=None)
