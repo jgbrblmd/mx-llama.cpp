@@ -209,6 +209,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -350,6 +351,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -2989,8 +2991,61 @@ private:
             if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                 has_pending_prompt = true;
             }
-            if (slot.state == SLOT_STATE_GENERATING) {
-                has_active_generation = true;
+
+            // check if we can batch this slot with the previous one
+            if (!slot_batched) {
+                slot_batched = &slot;
+            } else if (!slot_batched->can_batch_with(slot)) {
+                return;
+            }
+
+            generating.push_back(&slot);
+
+            if (spec) {
+                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+
+                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                const int n_draft_max = slot.get_n_draft_max();
+
+                if (n_draft_max > 0) {
+                    GGML_ASSERT(slot.can_speculate());
+
+                    if (!slot.spec_draft.empty()) {
+                        // we have a previous (partial) draft to reuse
+                        if (use_ckpt_tgt) {
+                            GGML_ASSERT(!slot.spec_ckpt.empty());
+                        }
+                    } else {
+                        GGML_ASSERT(slot.spec_i_batch.empty());
+
+                        slot.spec_ckpt.update_pos(
+                                slot.prompt.n_tokens(),
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                        if (use_ckpt_dft) {
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+
+                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+
+                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                            /* .drafting = */ true,
+                            /* .n_max    = */ n_draft_max,
+                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .id_last  = */ slot.sampled,
+                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .result   = */ &slot.spec_draft,
+                            /* .dists    = */ &slot.spec_dists,
+                            /* .temperature = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
+                        };
+
+                        drafting.push_back(&slot);
+                    }
+                }
             }
         });
 
@@ -3945,7 +4000,13 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                auto accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                slot.spec_dists.size() == slot.spec_draft.size()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3966,6 +4027,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -3993,6 +4055,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const int64_t t_now = ggml_time_us();
