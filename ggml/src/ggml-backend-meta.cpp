@@ -2969,16 +2969,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // reads after it? If so the whole buffer would have to be
                     // relayed. Rewind the seam to before its first write so the
                     // writes land on the same stage as the reads.
+                    // Fixed-point: moving the seam can make a DIFFERENT persistent
+                    // buffer straddle it (measured: cache_k snapped the seam to its
+                    // first write while the indexer state's compress write sat one
+                    // node earlier, so the state buffer straddled the moved seam and
+                    // the relay clobbered the new stage's freshly written state).
+                    // Rewind until no buffer has a write before and a read after the
+                    // evolving seam position.
                     int snap_to = i;
-                    for (const auto & kv : persist_first_write) {
-                        const int w = kv.second;
-                        if (w < i_start || w >= i) continue;
-                        const auto it_r = persist_last_read.find(kv.first);
-                        if (it_r == persist_last_read.end() || it_r->second < i) continue;
-                        if (w < snap_to) snap_to = w;
+                    for (bool changed = true; changed; ) {
+                        changed = false;
+                        for (const auto & kv : persist_first_write) {
+                            const int w = kv.second;
+                            if (w < i_start || w >= snap_to) continue;
+                            const auto it_r = persist_last_read.find(kv.first);
+                            if (it_r == persist_last_read.end() || it_r->second < snap_to) continue;
+                            if (w < snap_to) { snap_to = w; changed = true; }
+                        }
                     }
-                    if (snap_to > i_start && snap_to < i) {
-                        // re-run this node under the new stage on the next iteration
+                    if (snap_to >= i_start && snap_to < i) {
+                        // re-run from the snap point under the new stage. snap_to ==
+                        // i_start moves the whole block: the closed subgraph is then
+                        // empty and only carries the TRANSFER closure whose xfer set
+                        // (built later against this boundary) ships the pre-boundary
+                        // deps to the new stage.
                         i = snap_to - 1;
                         stage_transition = false;
                         for (size_t j = 0; j < n_backends; j++) {
@@ -3851,6 +3865,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         for (size_t i = r.i_beg; i < r.i_end; i++) {
                             const auto & sg = backend_ctx->subgraphs[i];
                             auto & bcj = backend_ctx->backend_configs[lane_lo + k];
+                            if (bcj.cgraphs[i].cgraph_main->n_nodes == 0) {
+                                continue;
+                            }
                             if (ggml_backend_graph_compute_async(bj, bcj.cgraphs[i].cgraph_main)
                                     != GGML_STATUS_SUCCESS) {
                                 ok = false; break;
@@ -3931,12 +3948,16 @@ per_subgraph_dispatch:
                 auto & bcj = backend_ctx->backend_configs[j];
                 auto & jb  = disp.jobs[j - lane_lo - 1];
                 jb.backend = bcj.backend;
-                jb.cgraph  = bcj.cgraphs[i].cgraph_main;
+                // an empty subgraph (seam snapped to the block start) carries only
+                // its closure - nothing to compute on the lanes
+                jb.cgraph  = bcj.cgraphs[i].cgraph_main->n_nodes > 0 ? bcj.cgraphs[i].cgraph_main : nullptr;
             }
             disp.dispatch_async();
 
             auto & bc0 = backend_ctx->backend_configs[lane_lo];
-            const ggml_status status_self = ggml_backend_graph_compute_async(bc0.backend, bc0.cgraphs[i].cgraph_main);
+            const ggml_status status_self = bc0.cgraphs[i].cgraph_main->n_nodes > 0
+                ? ggml_backend_graph_compute_async(bc0.backend, bc0.cgraphs[i].cgraph_main)
+                : GGML_STATUS_SUCCESS;
 
             // Join before inspecting either status: the workers must be quiesced before we
             // can return, otherwise they would still be touching backend state.
@@ -3951,6 +3972,9 @@ per_subgraph_dispatch:
         } else {
             for (size_t j = lane_lo; j < lane_hi; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
+                if (bcj.cgraphs[i].cgraph_main->n_nodes == 0) {
+                    continue;
+                }
                 const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
