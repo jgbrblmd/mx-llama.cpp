@@ -158,6 +158,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--rocmfp4", action="store_true",
+        help="Write the ROCmFP4 STRIX recipe directly (token_embd Q6_K, attn k/v Q4_0_ROCMFP4, rest Q4_0_ROCMFP4_FAST, 1d/norms F32). Uses the C reference quantizers; --outtype is ignored (file type 105 is written)."
+    )
+    parser.add_argument(
+        "--quantize-threads", type=int, default=4,
+        help="threads for the --rocmfp4 reference quantization (default 4)"
+    )
+    parser.add_argument(
         "--target-model-dir", type=str, default=None,
         help=(
             "path to the target model directory; required when converting a standalone draft model "
@@ -290,6 +298,8 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     rocmfp4=args.rocmfp4,
+                                     quantize_threads=args.quantize_threads,
                                      )
 
         if args.vocab_only:
