@@ -393,6 +393,47 @@ class _QwenMtpMixin:
 class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # File-level RMSNorm convention detection (see _detect_norm_file_convention):
+        # decides once per checkpoint whether *any* norm is raw (straddles/goes
+        # negative) or all norms are 1-centered, so finetuned 1-centered tensors
+        # whose mean drifts outside (0.5, 1.5) are not double-offset.
+        self._file_norms_all_positive: bool = self._detect_norm_file_convention()
+
+    def _detect_norm_file_convention(self) -> bool:
+        """True iff the whole checkpoint uses 1-centered norm weights.
+
+        unsloth (and friends) export the *effective* gain (1 + raw) for every
+        norm, so values cluster near 1; a finetune can push a few entries
+        slightly below 0, but never deep (observed min -0.156). Standard HF
+        exports store the *raw* param (init 0): at least one norm is
+        substantially negative (observed post_attention_layernorm all-negative,
+        min -0.996) and the file-wide norm mean stays near 0 (observed ~0.3).
+
+        Criterion (verified on Qwen3.8-27B base -> raw, and the unsloth
+        GAIN export -> 1-centered): file min > -0.25 AND file mean > 0.5.
+        linear_attn.norm is 1-centered under BOTH conventions, so it is
+        excluded. Fallback on any error: per-tensor sniffing (False).
+        """
+        try:
+            from .base import LazyTorchTensor
+            all_v: list[Tensor] = []
+            saw_norm = False
+            for tname, tgen in self.model_tensors.items():
+                if not tname.endswith("norm.weight") or tname.endswith("linear_attn.norm.weight"):
+                    continue
+                if tname.endswith(".biases"):
+                    continue
+                saw_norm = True
+                all_v.append(LazyTorchTensor.to_eager(tgen()).reshape(-1))
+            if not saw_norm:
+                return False
+            v = torch.cat(all_v)
+            return v.numel() > 0 and float(v.min().item()) > -0.25 and float(v.mean().item()) > 0.5
+        except Exception:
+            return False
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
@@ -418,7 +459,29 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         elif "conv1d" in name:
             data_torch = data_torch.squeeze()
         elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight") and self._apply_norm_offset:
-            data_torch = data_torch + 1
+            # The +1 bakes in the 1-centered (1 + raw) gain the runtime expects.
+            # A standard HF export stores the *raw* param (init 0, straddles zero),
+            # so the +1 is required. But some exports (e.g. unsloth) already store
+            # the *effective* gain (1 + raw) for EVERY norm: adding +1 again
+            # doubles the gain and garbles the output.
+            #
+            # Primary test is the file-level convention (see
+            # _detect_norm_file_convention): all norms all-positive -> the whole
+            # checkpoint is 1-centered, skip the +1. This catches finetuned
+            # tensors whose mean drifted outside (0.5, 1.5), e.g. a final norm
+            # at 1.95. Fallback (raw convention, or prepass inconclusive):
+            # per-tensor sniffing, only skip when clearly 1-centered.
+            if self._file_norms_all_positive:
+                pass
+            else:
+                from .base import LazyTorchTensor
+                try:
+                    _chk = LazyTorchTensor.to_eager(data_torch).reshape(-1)
+                    _one_centered = bool(torch.all(_chk > 0).item()) and 0.5 < float(_chk.mean().item()) < 1.5
+                except Exception:
+                    _one_centered = False
+                if not _one_centered:
+                    data_torch = data_torch + 1
 
         if "in_proj_qkvz.weight" in name:
             # original order:  [q, k, v, z] * head_count
@@ -475,15 +538,24 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
     The runtime (fused GDN) needs to know the pairing convention the checkpoint
     was converted with: this repo's pipeline reorders V heads to tiled order,
-    while MLX affine (u32) checkpoints keep the grouped layout as-is. The flag
-    is written into the GGUF as <arch>.ssm.v_heads_tiled.
+    while MLX-sourced checkpoints (affine u32, mxfp4, ...) keep the checkpoint's
+    grouped layout as-is. The flag is written into the GGUF as
+    <arch>.ssm.v_heads_tiled.
     """
+
+    def _is_mlx_quant_source(self) -> bool:
+        # MLX exports tag their quantization with a `mode` key (HF uses
+        # `quant_method`); their GDN v-head layout is the checkpoint-native
+        # grouped order, paired by the runtime at load time instead of the
+        # convert-side grouped->tiled reorder.
+        qc = self.hparams.get("quantization_config")
+        if not isinstance(qc, dict):
+            return False
+        return qc.get("mode") is not None or (qc.get("quant_method") or qc.get("mode")) == "affine"
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        qc = self.hparams.get("quantization_config")
-        is_mlx_affine = isinstance(qc, dict) and ((qc.get("quant_method") or qc.get("mode")) == "affine")
-        self.gguf_writer.add_ssm_v_heads_tiled(not is_mlx_affine)
+        self.gguf_writer.add_ssm_v_heads_tiled(not self._is_mlx_quant_source())
 
     @staticmethod
     def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
@@ -592,8 +664,10 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
 
-        # Skip V head reordering for U32 compressed quantization (will be handled at load time)
-        if data_torch.dtype == torch.uint32:
+        # Skip V head reordering for U32 compressed quantization and for
+        # dequantized MLX sources (mxfp4 -> bf16): the checkpoint keeps its
+        # grouped layout, which the runtime pairs at load time (v_heads_tiled=false)
+        if data_torch.dtype == torch.uint32 or self._is_mlx_quant_source():
             yield from super().modify_tensors(data_torch, name, bid)
             return
 
