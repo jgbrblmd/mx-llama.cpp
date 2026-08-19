@@ -47,6 +47,13 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
+    // DFlash2 needs n_outputs_max >= n_batch to accommodate all speculative tokens
+    const bool has_dflash = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+    if (has_dflash) {
+        return n_batch;
+    }
+
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
@@ -75,6 +82,7 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
+        bool is_prompt;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -110,22 +118,22 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt = false) {
         GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output });
+        tokens.push_back({ id_slot, token, pos, output, is_prompt });
         return true;
     }
 
-    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output) {
+    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt = false) {
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output });
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -349,10 +357,10 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
+        spec_i_batch.clear();  // always clear, even without spec
         if (can_speculate()) {
             spec_draft.clear();
             spec_dists.clear();
-            spec_i_batch.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -495,9 +503,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true);
+                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
+                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -506,7 +514,8 @@ struct server_slot {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
-            GGML_ASSERT(spec_i_batch.empty());
+            // clear any leftover spec_i_batch from previous iteration
+            spec_i_batch.clear();
 
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -515,9 +524,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true);
+            add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+                add_ok &= batch.add(this->id, token, pos0++, true, false);
             }
         }
 
@@ -2991,61 +3000,14 @@ private:
             if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                 has_pending_prompt = true;
             }
-
-            // check if we can batch this slot with the previous one
-            if (!slot_batched) {
-                slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
+            if (slot.state == SLOT_STATE_GENERATING) {
+                has_active_generation = true;
             }
 
-            generating.push_back(&slot);
-
+            // reset the drafting flag for every slot so that slots not participating
+            // in this iteration's draft cannot carry a stale drafting state
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
-
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-                const int n_draft_max = slot.get_n_draft_max();
-
-                if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
-
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
-                        }
-                    } else {
-                        GGML_ASSERT(slot.spec_i_batch.empty());
-
-                        slot.spec_ckpt.update_pos(
-                                slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
-
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
-
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                            /* .dists    = */ &slot.spec_dists,
-                            /* .temperature = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
-                        };
-
-                        drafting.push_back(&slot);
-                    }
-                }
             }
         });
 
@@ -3121,6 +3083,9 @@ private:
                                 /* .id_last  = */ slot.sampled,
                                 /* .prompt   = */ &slot.spec_prompt,
                                 /* .result   = */ &slot.spec_draft,
+                                /* .dists    = */ &slot.spec_dists,
+                                /* .temperature = */ slot.task->params.sampling.temp,
+                                /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                             };
 
                             drafting.push_back(&slot);
@@ -3632,7 +3597,8 @@ private:
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
-                            slot.need_embd());
+                            slot.need_embd(),
+                            false);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
