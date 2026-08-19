@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/q8_repack/repack.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2286,6 +2287,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2312,6 +2317,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2448,6 +2457,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        ggml_cuda_mul_mat_repacked(ctx, src0, src1, dst);
+        return;
+    }
+
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
@@ -2502,6 +2516,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        ggml_cuda_mul_mat_id_repacked(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
@@ -3066,6 +3085,13 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buft_is_cuda_repack(buf->buft)) {
+        // Chunked canonical bytes stage into device scratch; the repack kernel
+        // fires on the same stream once the tensor is complete.
+        ggml_cuda_repack_set_tensor_async(cuda_ctx->device, cuda_ctx->stream(), tensor, data, offset, size);
+        return;
+    }
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -4644,6 +4670,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // Repacked weights: fuse the up/gate dot products in the MMV kernel
+            // (both lanes share the same quantized input). Dense single-token
+            // only: MoE (ids) and prefill (ne[1] > 1) fall through to the GEMM.
+            if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
+                ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
+                ids == nullptr && glu->ne[1] == 1) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate   = gate->src[0];
+                fusion_data.glu_op = ggml_get_glu_op(glu);
+
+                ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
@@ -4804,6 +4846,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
+
+        // Repacked weights: fold up + x_bias into the MMV kernel (bias-only fused
+        // path, no gate lane). Dense single-token only; MoE (ids) and prefill
+        // (ne[1] > 1) fall through to the repacked GEMM. The same-shape guard
+        // above guarantees the bias matches the mm output layout the host expects.
+        if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
+            ids == nullptr && mm_node->ne[1] == 1) {
+            ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, bias_node, &fusion_data);
+            fused_mul_mat_vec = true;
+            fused_node_count  = 2;
+            break;
+        }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
@@ -5125,6 +5179,12 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static thread_local bool g_cuda_outer_capture = false;
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    {
+        // The repack upload scratch lives only between model load and the first
+        // compute; once released this is a single pointer test.
+        ggml_backend_cuda_context * ctx0 = (ggml_backend_cuda_context *) backend->context;
+        ggml_cuda_repack_async_release(ctx0->device);
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -5771,6 +5831,34 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    // GCN repacked weights are stored in a non-canonical two-plane layout and can only be
+    // consumed as src0 of MUL_MAT / MUL_MAT_ID by the repacked dispatch. Reject every other
+    // use so the model loader never places a repacked weight where a canonical-layout op
+    // (e.g. GET_ROWS on a Q8_0 embedding) would misread it. Direct (non-meta) repack bufts
+    // only: a meta-wrapped repack buft is handled authoritatively by the gate in
+    // ggml_backend_meta_device_supports_op before delegation, and dispatch sees the lane's
+    // direct buft.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->buffer &&
+            ggml_backend_buft_is_cuda_repack(op->src[i]->buffer->buft)) {
+            if (i != 0) {
+                return false;   // a repacked weight can only be src0
+            }
+            if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+                return false;
+            }
+            // Views of repacked weights are re-packed on the fly by the dispatch, so
+            // accept a view whose base is supported too.
+            if (!ggml_cuda_repack_mul_mat_should_fire(op->src[0])) {
+                return false;
+            }
+            if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 ||
+                op->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -6289,7 +6377,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev)
+        || (integrated && ggml_backend_buft_is_cuda_host(buft))
+        || (ggml_backend_buft_is_cuda_repack(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6478,10 +6568,10 @@ static void * ggml_backend_cuda_token_capture_end(ggml_backend_t backend) {
     }
     cudaGraphExec_t exec = nullptr;
     if (cudaGraphInstantiate(&exec, captured, nullptr, nullptr, 0) != cudaSuccess) {
-        cudaGraphDestroy(captured);
+        CUDA_CHECK(cudaGraphDestroy(captured));
         return nullptr;
     }
-    cudaGraphDestroy(captured);
+    CUDA_CHECK(cudaGraphDestroy(captured));
     return (void *) exec;
 }
 
@@ -6494,7 +6584,7 @@ static void ggml_backend_cuda_token_graph_launch(ggml_backend_t backend, void * 
 static void ggml_backend_cuda_token_graph_free(ggml_backend_t backend, void * exec) {
     GGML_UNUSED(backend);
     if (exec != nullptr) {
-        cudaGraphExecDestroy((cudaGraphExec_t) exec);
+        CUDA_CHECK(cudaGraphExecDestroy((cudaGraphExec_t) exec));
     }
 }
 
@@ -6549,6 +6639,27 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        static ggml_backend_dev_get_extra_bufts_t fct =
+            [](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t * {
+                ggml_backend_cuda_device_context * dev_ctx =
+                    (ggml_backend_cuda_device_context *) dev->context;
+                static std::mutex mutex;
+                static std::unordered_map<int, std::vector<ggml_backend_buffer_type_t>> buft_cache;
+                std::lock_guard<std::mutex> lock(mutex);
+                auto & extra_bufts = buft_cache[dev_ctx->device];
+                if (extra_bufts.empty()) {
+                    ggml_backend_buffer_type_t buft =
+                        ggml_backend_cuda_repack_buffer_type(dev_ctx->device);
+                    if (buft) {
+                        extra_bufts.push_back(buft);
+                    }
+                    extra_bufts.push_back(nullptr);
+                }
+                return extra_bufts.data();
+            };
+        return (void *)fct;
     }
     return nullptr;
 }

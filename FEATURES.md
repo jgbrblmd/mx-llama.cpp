@@ -1,8 +1,64 @@
 # Features
 
 This fork extends upstream llama.cpp with multi-GPU and speculative-decoding
-optimizations. Most additions are backend-generic; the gfx906 (VEGA20) kernel
-tuning is the only hardware-specific part.
+optimizations. Most additions are backend-generic; the hardware-specific parts
+are the gfx906 (VEGA20) kernel tuning and the Q8_0 weight repack, both targeting
+MI50 / MI60 / Radeon VII class GPUs.
+
+## Building from source
+
+Requires a ROCm toolchain with gfx906 support (rocBLAS gfx906 kernels, plus RCCL
+for `GGML_HIP_RCCL`). Note gfx906 is deprecated in ROCm 7.x. See `docs/build.md`
+for general HIP build background.
+
+```bash
+cmake -B build \
+  -DGGML_HIP=ON \
+  -DGGML_HIP_GRAPHS=ON \
+  -DGGML_HIP_RCCL=ON \
+  -DLLAMA_OPENSSL=ON \
+  -DAMDGPU_TARGETS=gfx906 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHIP_COMPILER=clang \
+  -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument"
+cmake --build build --config Release -j
+```
+
+## Running
+
+Recommended environment (each variable enables one of the features above):
+
+```bash
+export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
+export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
+export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
+export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
+```
+
+On a trimmed ROCm runtime (such as the slim Docker image) also set
+`HSA_OVERRIDE_GFX_VERSION=9.0.6` so the runtime recognizes the gfx906 GPU. A full
+ROCm install detects it automatically and does not need this.
+
+Always pass `-lm dio` (`--load-mode dio`). mmap on the model file hangs on this
+stack. The older `--no-mmap` / `-dio` spellings still parse but are deprecated
+upstream, and in `llama-bench` they append two separate load modes, so the old
+two-flag form runs every benchmark twice. Select GPUs with `HIP_VISIBLE_DEVICES`
+(AMD) or `CUDA_VISIBLE_DEVICES` (NVIDIA); the example commands below use the AMD
+form.
+
+```bash
+# multi-GPU tensor-parallel server (4 GPUs, full TP)
+HIP_VISIBLE_DEVICES=0,1,2,3 llama-server -m model.gguf \
+  -ngl 99 -fa 1 -sm tensor -tps 0 -lm dio --host 0.0.0.0 --port 8080
+
+# 8 GPUs as 4 TP groups of 2 (TP=2, PP=4)
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 llama-cli -m model.gguf \
+  -ngl 99 -fa 1 -sm tensor -tps 2 -lm dio
+
+# MTP speculative decode (Qwen3.6 dense)
+HIP_VISIBLE_DEVICES=0,1 llama-cli -m Qwen3.6-27B-MTP.gguf \
+  -ngl 99 -fa 1 -sm tensor --spec-type draft-mtp -lm dio
+```
 
 ## Multi-stage tensor parallelism (`-tps`)
 
@@ -153,57 +209,16 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Building from source
+## Q8_0 weight repack (gfx906)
 
-Requires a ROCm toolchain with gfx906 support (rocBLAS gfx906 kernels, plus RCCL
-for `GGML_HIP_RCCL`). Note gfx906 is deprecated in ROCm 7.x. See `docs/build.md`
-for general HIP build background.
-
-```bash
-cmake -B build \
-  -DGGML_HIP=ON \
-  -DGGML_HIP_GRAPHS=ON \
-  -DGGML_HIP_RCCL=ON \
-  -DLLAMA_OPENSSL=ON \
-  -DAMDGPU_TARGETS=gfx906 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DHIP_COMPILER=clang \
-  -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument"
-cmake --build build --config Release -j
-```
-
-## Running
-
-Recommended environment (each variable enables one of the features above):
-
-```bash
-export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
-export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
-export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
-export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
-```
-
-On a trimmed ROCm runtime (such as the slim Docker image) also set
-`HSA_OVERRIDE_GFX_VERSION=9.0.6` so the runtime recognizes the gfx906 GPU. A full
-ROCm install detects it automatically and does not need this.
-
-Always pass `-lm dio` (`--load-mode dio`). mmap on the model file hangs on this
-stack. The older `--no-mmap` / `-dio` spellings still parse but are deprecated
-upstream, and in `llama-bench` they append two separate load modes, so the old
-two-flag form runs every benchmark twice. Select GPUs with `HIP_VISIBLE_DEVICES`
-(AMD) or `CUDA_VISIBLE_DEVICES` (NVIDIA); the example commands below use the AMD
-form.
-
-```bash
-# multi-GPU tensor-parallel server (4 GPUs, full TP)
-HIP_VISIBLE_DEVICES=0,1,2,3 llama-server -m model.gguf \
-  -ngl 99 -fa 1 -sm tensor -tps 0 -lm dio --host 0.0.0.0 --port 8080
-
-# 8 GPUs as 4 TP groups of 2 (TP=2, PP=4)
-HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 llama-cli -m model.gguf \
-  -ngl 99 -fa 1 -sm tensor -tps 2 -lm dio
-
-# MTP speculative decode (Qwen3.6 dense)
-HIP_VISIBLE_DEVICES=0,1 llama-cli -m Qwen3.6-27B-MTP.gguf \
-  -ngl 99 -fa 1 -sm tensor --spec-type draft-mtp -lm dio
-```
+Q8_0 weights upload into a two-plane layout (quants and scales in separate
+planes) with tiled MMQ and mat-vec kernels reading it directly, contributed
+by DENEB1312. On by default on gfx906, carried by the extra buffer types
+like upstream's CPU weight repack, so `--no-repack` disables it; a draft
+model always loads canonical weights. Measured on 2x MI50: prefill +12 to
++41% across dense and MoE models and both split modes, generation within a
+couple percent of the canonical path. Prefill is bit-exact and perplexity
+unchanged; greedy generation can differ within floating-point
+reassociation. Model load stages canonical bytes and repacks on the
+device, so `-sm layer` loads at vanilla-loader parity and tensor-parallel
+loads within about 1.4x of it. Validated on gfx906.
