@@ -364,7 +364,8 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
-        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
+        uint32_t n_outputs_max;       // max outputs in a ubatch (0 = n_batch)
+        uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -1321,6 +1322,7 @@ extern "C" {
     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
+    LLAMA_API void                   llama_sampler_copy  (const struct llama_sampler * src, struct llama_sampler * dst);
     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)
     LLAMA_API void                   llama_sampler_free  (      struct llama_sampler * smpl);
 
