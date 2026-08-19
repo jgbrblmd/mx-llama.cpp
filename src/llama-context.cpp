@@ -268,6 +268,8 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+    cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+            cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -328,6 +330,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
+    LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -2731,6 +2734,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint32_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
@@ -2740,33 +2744,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        res = std::max<uint32_t>(1024u, 8u * model.n_tensors());
     }
 
     if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         const uint32_t selector_tokens = std::min<uint32_t>(
                 n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
-        res += 32*selector_tokens;
+        res += 32 * selector_tokens;
     }
 
-    uint32_t n_sampling_nodes = 0;
-    uint32_t n_sampling_nodes_max = 0;
-    for (const auto & [seq_id, sampler] : sampling.samplers) {
-        const uint32_t n_nodes = llama_sampler_backend_n_nodes(sampler);
-        n_sampling_nodes += n_nodes;
-        if (cparams.n_outputs_max_per_seq > 1) {
-            n_sampling_nodes_max = std::max(n_sampling_nodes_max, n_nodes);
-        }
-    }
-
-    const uint32_t n_sampling_outputs_max = std::min<uint64_t>(
-            std::min(n_tokens, cparams.n_outputs_max),
-            (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
-
-    res += n_sampling_nodes;
-    if (n_sampling_outputs_max > 1) {
-        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
-    }
     return res;
 }
 
@@ -3903,6 +3891,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.n_outputs_max_per_seq       =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
