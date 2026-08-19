@@ -620,7 +620,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output = model_other->output;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    cur = build_lora_mm(output, cur, model.output_s);
 
     if (hparams.f_logit_scale != 0.0f) {
         cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
