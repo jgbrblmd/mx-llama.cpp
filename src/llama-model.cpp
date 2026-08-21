@@ -1963,7 +1963,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const auto * layer_dev = tn.bid == -1 ? nullptr : &pimpl->dev_layer.at(tn.bid);
+    const buft_list_t * buft_list_layer = layer_dev == nullptr ? nullptr : layer_dev->buft_list;
+
+    // DSV4 splits shared-expert up/gate rows across the TP group. Below 512
+    // rows per lane the gfx906 repacked MMV loses to the canonical kernel;
+    // TPS4 lands exactly at 512 while TPS8 lands at 256 for this model.
+    const size_t tp_width = params.split_mode == LLAMA_SPLIT_MODE_TENSOR && get_split_state_ud.n_stages > 0
+        ? get_split_state_ud.n_devices / get_split_state_ud.n_stages : 0;
+    const bool narrow_shexp = arch == LLM_ARCH_DEEPSEEK4 && layer_dev != nullptr && tp_width > 0 && ne.size() > 1 &&
+        (tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP) &&
+        (size_t) ne.begin()[1] / tp_width < 512;
+    if (narrow_shexp) {
+        buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
