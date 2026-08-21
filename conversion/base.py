@@ -267,6 +267,11 @@ class ModelBase:
         tensor_names_from_parts: set[str] = set()
 
         if not self.is_mistral_format:
+            # Fall back to model.safetensors.index.json if no model files found
+            if not is_safetensors:
+                st_index = self.dir_model / "model.safetensors.index.json"
+                if st_index.is_file():
+                    is_safetensors = True
             index_name = "model.safetensors" if is_safetensors else "pytorch_model.bin"
             index_name += ".index.json"
             index_file = self.dir_model / index_name
