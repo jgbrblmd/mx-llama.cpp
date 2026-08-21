@@ -1628,7 +1628,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // shard cannot serve. Replicate the projection when that drafter is in use. The
     // decision travels through an env var so llama_model_params stays at the public
     // upstream layout - llama_model::tensor_mirror_output reads it back at load.
-    const bool mirror_output = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+    const bool mirror_output = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end() ||
+                               std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 #if defined(_WIN32)
     _putenv_s("LLAMA_TENSOR_MIRROR_OUTPUT", mirror_output ? "1" : "0");
 #else

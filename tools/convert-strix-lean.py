@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Convert a Qwen3.8/3.5 hybrid bf16 GGUF to ROCmFP4 (STRIX_LEAN recipe).
+"""Convert a Qwen3.8/3.5 hybrid bf16 GGUF to ROCmFP4 or MXFP8 (STRIX_LEAN recipe).
 
-Recipe (reverse-engineered from Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf):
+ROCmFP4 recipe (reverse-engineered from Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf):
   - token_embd.weight          -> Q6_K
   - attn_qkv (GDN fused) / attn_k / attn_v -> Q4_0_ROCMFP4     (2-scale layout)
   - all other quantizable weights -> Q4_0_ROCMFP4_FAST         (incl. ssm_alpha/beta)
+  - norms / biases / ssm_a / ssm_dt / ssm_conv1d -> F32
+
+MXFP8 recipe (--output mxfp8):
+  - token_embd.weight          -> Q6_K
+  - all quantizable weights   -> Q8_0_ROCMFPX (UE4M3 scale + 8-bit codebook)
   - norms / biases / ssm_a / ssm_dt / ssm_conv1d -> F32
 
 Differences vs convert-jormungandr-rocmfp4.py:
@@ -14,10 +19,10 @@ Differences vs convert-jormungandr-rocmfp4.py:
      like ssm_alpha [5120, 48] get FASTed instead of staying F32.
   3. F32 whitelist is exact-ish (ssm_a / ssm_dt / ssm_conv1d), not the
      'ssm_a' substring that also caught ssm_alpha.
-  4. general.file_type = 106 (vs 105).
+  4. general.file_type = 106 (ROCmFP4) or 111 (MXFP8).
 
 Usage:
-    python convert-strix-lean-rocmfp4.py <bf16-gguf> <out-gguf> [nthreads] [arch]
+    python convert-strix-lean-rocmfp4.py <bf16-gguf> <out-gguf> [--output rocmfp4|mxfp8] [nthreads] [arch]
 """
 
 import sys
@@ -89,6 +94,19 @@ def quantize_q6k_flat(data_f32):
     fn(data_f32.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p), n)
     return out
 
+def quantize_rocmfpx_fp8_flat(data_f32):
+    """Quantize a flat float32 array to MXFP8 (Q8_0_ROCMFPX, 33 bytes per 32 values)."""
+    lib = _lib()
+    fn = lib['rocmfpx_quantize_row_fp8_ref']
+    fn.restype = None
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong]
+    n = data_f32.size
+    assert n % 32 == 0, f'{n} not a multiple of 32'
+    out_size = n * 33 // 32
+    out = np.empty(out_size, dtype=np.uint8)
+    fn(data_f32.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p), n)
+    return out
+
 def read_source_data(src_ti):
     """Read source tensor data as a flat float32 array, one value per logical element.
 
@@ -107,21 +125,23 @@ def read_source_data(src_ti):
 # ---------------------------------------------------------------------------
 # Main conversion logic
 # ---------------------------------------------------------------------------
-if len(sys.argv) < 3:
-    sys.exit(f'''Usage: {Path(sys.argv[0]).name} <bf16-gguf> <out-gguf> [nthreads] [arch]
+import argparse
 
-  <bf16-gguf>  source bf16 GGUF (Qwen3.8/3.5 hybrid)
-  <out-gguf>   output ROCmFP4 GGUF
-  [nthreads]   quantize threads (default 4)
-  [arch]       output arch tag (default qwen35)
+parser = argparse.ArgumentParser(description='Convert bf16 GGUF to ROCmFP4 or MXFP8 (STRIX_LEAN recipe)')
+parser.add_argument('bf16_gguf', help='source bf16 GGUF (Qwen3.8/3.5 hybrid)')
+parser.add_argument('out_gguf', help='output quantized GGUF')
+parser.add_argument('--output', '-o', choices=['rocmfp4', 'mxfp8'], default='rocmfp4',
+                    help='quantization format (default: rocmfp4)')
+parser.add_argument('--threads', '-t', type=int, default=4, help='quantize threads (default: 4)')
+parser.add_argument('--arch', '-a', default='qwen35', help='output arch tag (default: qwen35)')
 
-Example:
-  {Path(sys.argv[0]).name} Qwen3.8-27B-bf16.gguf Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf 8''')
+args = parser.parse_args()
 
-BF16_GGUF = sys.argv[1]
-OUT_GGUF = sys.argv[2]
-N_THREADS = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-ARCH = sys.argv[4] if len(sys.argv) > 4 else 'qwen35'
+BF16_GGUF = args.bf16_gguf
+OUT_GGUF = args.out_gguf
+N_THREADS = args.threads
+ARCH = args.arch
+OUTPUT_TYPE = args.output
 
 r = GGUFReader(BF16_GGUF, 'r')
 print(f'Reading {BF16_GGUF} ({len(r.tensors)} tensors)')
@@ -145,6 +165,8 @@ def is_f32_only(name, shape):
 def quant_type_for(name, shape):
     if name == 'token_embd.weight':
         return 'Q6_K'
+    if OUTPUT_TYPE == 'mxfp8':
+        return 'Q8_0_ROCMFPX'
     if (name.endswith('.attn_qkv.weight')
             or name.endswith('.attn_k.weight')
             or name.endswith('.attn_v.weight')):
@@ -167,12 +189,20 @@ for ti in r.tensors:
     tensors_info.append((name, shape, True, quant_type_for(name, shape)))
 
 type_counts = Counter(t[3] for t in tensors_info)
-print(f'Tensor type counts:')
+print(f'Tensor type counts ({OUTPUT_TYPE}):')
 for k, v in sorted(type_counts.items(), key=lambda x: -x[1]):
     print(f'  {k}: {v}')
 
 # Write output GGUF
 w = GGUFWriter(OUT_GGUF, ARCH)
+
+# Determine output file type
+if OUTPUT_TYPE == 'mxfp8':
+    OUT_FILE_TYPE = 111  # MOSTLY_Q8_0_ROCMFPX
+    OUT_QUANT_LABEL = 'Q8_0_ROCMFPX'
+else:
+    OUT_FILE_TYPE = 106  # MOSTLY_Q4_0_ROCMFP4
+    OUT_QUANT_LABEL = 'Q4_0_ROCMFP4'
 
 # Copy metadata from source
 for key, f in r.fields.items():
@@ -181,7 +211,7 @@ for key, f in r.fields.items():
     t = f.types
     vtype = t[0]
     if key == 'general.file_type':
-        w.add_key_value(key, 106, vtype)
+        w.add_key_value(key, OUT_FILE_TYPE, vtype)
         continue
     if vtype == GGUFValueType.ARRAY:
         w.add_key_value(key, f.contents(), vtype, sub_type=t[1])
@@ -208,6 +238,10 @@ def quantize_job(job):
         quantized = quantize_rocmfp4_flat(data)
         tsz, blk = 18, 32
         raw_dtype = GGMLQuantizationType.Q4_0_ROCMFP4
+    elif qtype == 'Q8_0_ROCMFPX':
+        quantized = quantize_rocmfpx_fp8_flat(data)
+        tsz, blk = 33, 32
+        raw_dtype = GGMLQuantizationType.Q8_0_ROCMFPX
     else:
         quantized = quantize_rocmfp4_fast_flat(data)
         tsz, blk = 17, 32
