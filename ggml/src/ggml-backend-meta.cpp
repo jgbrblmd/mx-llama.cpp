@@ -513,11 +513,14 @@ static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft) {
 static ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_from_simple(
         ggml_backend_dev_t dev, std::vector<ggml_backend_buffer_type_t> simple_bufts, bool repack) {
     static std::mutex mutex;
-    static std::map<std::pair<std::vector<ggml_backend_buffer_type_t>, bool>,
+    static std::map<std::tuple<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>, bool>,
                     struct ggml_backend_buffer_type> cache;
     std::lock_guard<std::mutex> lock(mutex);
 
-    auto key = std::make_pair(simple_bufts, repack);
+    // The buffer type retains dev, whose split callback can carry model-local
+    // userdata. Reusing it for another Meta device would leave tensor split
+    // queries bound to the first model after that model has been freed.
+    auto key = std::make_tuple(dev, simple_bufts, repack);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return &it->second;
