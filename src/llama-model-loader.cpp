@@ -909,6 +909,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     ggml_tensor * op_tensor = nullptr;
 
     switch (op) {
+        case GGML_OP_RESHAPE:
+            {
+                // A same-shape reshape still creates the view node that buffer-type
+                // gates need to see. Non-canonical layouts can then reject the weight.
+                op_tensor = ggml_reshape_2d(ctx, w, w->ne[0], w->ne[1]);
+            } break;
         case GGML_OP_GET_ROWS:
             {
                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
