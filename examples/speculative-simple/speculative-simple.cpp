@@ -84,7 +84,7 @@ int main(int argc, char ** argv) {
     // check if the context supports partial sequence removal
     const auto ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
     const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    const bool use_ckpt_dft = common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const bool use_ckpt_dft = common_context_can_seq_rm(ctx_dft.get()) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
     if (use_ckpt_tgt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
@@ -115,6 +115,7 @@ int main(int argc, char ** argv) {
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
+    int n_draft   = 0;
 
     // used to determine end of generation
     bool has_eos = false;
@@ -154,8 +155,6 @@ int main(int argc, char ** argv) {
 
     llama_tokens draft;
     std::vector<common_speculative_token_dist> dists;
-
-    llama_tokens draft;
     common_prompt_checkpoint ckpt;
 
     const auto t_enc_end = ggml_time_us();
@@ -195,7 +194,7 @@ int main(int argc, char ** argv) {
             common_speculative_draft(spec);
 
             // save the original draft size
-            n_draft = draft.size();
+            n_draft = (int) draft.size();
 
             // save a checkpoint of the target context before evaluating the draft
             // this allows us to restore the state if partial draft acceptance occurs
