@@ -21,6 +21,20 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }
 }
 
+bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids) {
+    // MoE fuses across the whole narrow range: its grid is one block per
+    // assignment, so at these widths launch overhead dominates and folding
+    // three launches into one pays. Dense does NOT: its grid already spans
+    // the full row count, there is ample parallelism to hide latency, and
+    // halving the block count to double the work per block costs more than
+    // the saved launches return. Measured on Qwen3.6-27B-MTP-Q8_0, pp512 at
+    // that ubatch, fused against unfused: +4.6% at 2 tokens, -2.7% at 3,
+    // +2.4% at 4 - and a speculative verify step is exactly 3 wide at the
+    // default draft depth, so dense fusion loses where it would be used.
+    const int64_t max_tokens = has_ids ? MMQ_RP_Q8_MOE_MMV_MAX_TOKENS : 1;
+    return n_tokens >= 1 && n_tokens <= max_tokens;
+}
+
 bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     if (src0->buffer == nullptr || !ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_get_type(src0->buffer))) {
         return false;

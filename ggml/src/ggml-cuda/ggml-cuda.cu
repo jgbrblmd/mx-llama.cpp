@@ -4685,13 +4685,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             // Repacked weights: fuse the up/gate dot products in the MMV kernel
             // (both lanes share the same quantized input, and for MoE the same
-            // expert lookup). Single token only, dense and MoE: prefill falls
-            // through to the repacked GEMM. Without this the repacked path runs
-            // up, gate and the GLU as three launches where the canonical path
-            // runs one, which is the whole of its decode deficit.
+            // expert lookup). Every width the narrow mat-vec serves, dense and
+            // MoE: prefill falls through to the repacked GEMM. Without this the
+            // repacked path runs up, gate and the GLU as three launches where
+            // the canonical path runs one, which is the whole of its decode
+            // deficit - and a speculative verify step is 2 to 4 tokens wide, so
+            // fusing only at one token never fired under MTP at all.
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
-                (ids == nullptr ? glu->ne[1] == 1 : glu->ne[2] == 1)) {
+                ggml_cuda_repack_mmv_fusion_width_ok(
+                    ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);

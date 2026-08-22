@@ -1605,6 +1605,39 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    // Carry the DSpark output-layout choice with this model load. A process-wide
+    // environment variable can be overwritten while another model is loading.
+    static constexpr const char * tensor_mirror_output_key = "mxxm.tensor_mirror_output";
+    const bool tensor_mirror_output =
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+
+    auto mirror_override = std::find_if(params.kv_overrides.begin(), params.kv_overrides.end(), [](const auto & entry) {
+        return std::strcmp(entry.key, tensor_mirror_output_key) == 0;
+    });
+    if (tensor_mirror_output) {
+        if (mirror_override == params.kv_overrides.end()) {
+            if (!params.kv_overrides.empty()) {
+                GGML_ASSERT(params.kv_overrides.back().key[0] == 0 && "KV overrides not terminated with empty key");
+                params.kv_overrides.pop_back();
+            }
+            llama_model_kv_override entry = {};
+            std::strcpy(entry.key, tensor_mirror_output_key);
+            params.kv_overrides.push_back(entry);
+            params.kv_overrides.emplace_back();
+            params.kv_overrides.back().key[0] = 0;
+            mirror_override = params.kv_overrides.end() - 2;
+        }
+        mirror_override->tag      = LLAMA_KV_OVERRIDE_TYPE_BOOL;
+        mirror_override->val_bool = true;
+    } else if (mirror_override != params.kv_overrides.end()) {
+        GGML_ASSERT(params.kv_overrides.back().key[0] == 0 && "KV overrides not terminated with empty key");
+        params.kv_overrides.erase(mirror_override);
+        if (params.kv_overrides.size() == 1) {
+            params.kv_overrides.clear();
+        }
+    }
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -1623,18 +1656,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    // the DSpark draft head borrows the target's output projection and runs an in-graph
-    // argmax over the whole vocabulary on the logits it produces, which a vocabulary
-    // shard cannot serve. Replicate the projection when that drafter is in use. The
-    // decision travels through an env var so llama_model_params stays at the public
-    // upstream layout - llama_model::tensor_mirror_output reads it back at load.
-    const bool mirror_output = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end() ||
-                               std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
-#if defined(_WIN32)
-    _putenv_s("LLAMA_TENSOR_MIRROR_OUTPUT", mirror_output ? "1" : "0");
-#else
-    setenv("LLAMA_TENSOR_MIRROR_OUTPUT", mirror_output ? "1" : "0", 1);
-#endif
 
     return mparams;
 }

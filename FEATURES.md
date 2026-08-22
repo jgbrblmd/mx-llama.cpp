@@ -221,4 +221,9 @@ couple percent of the canonical path. Prefill is bit-exact and perplexity
 unchanged; greedy generation can differ within floating-point
 reassociation. Model load stages canonical bytes and repacks on the
 device, so `-sm layer` loads at vanilla-loader parity and tensor-parallel
-loads within about 1.4x of it. Validated on gfx906.
+loads within about 1.4x of it. Narrow batches, such as the multi-token
+steps a speculative verify produces, pick their mat-vec geometry from the
+row length and fuse the MoE up and gate lanes, which puts them at or ahead
+of the canonical path per decode step; perplexity there moves within
+floating-point reassociation (6.2197 to 6.2283 on a 27B dense model at two
+tokens) while wide batches stay exact. Validated on gfx906.

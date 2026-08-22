@@ -1347,6 +1347,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool tensor_mirror_output = false;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1374,6 +1375,8 @@ void llama_model_base::load_stats(llama_model_loader & ml) {
 
 void llama_model_base::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
+
+    ml.get_key("mxxm.tensor_mirror_output", pimpl->tensor_mirror_output, false);
 
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
@@ -2313,12 +2316,7 @@ const float * llama_model::tensor_split() const {
 }
 
 bool llama_model::tensor_mirror_output() const {
-    // Internal bridge instead of a public llama_model_params field. The one
-    // consumer that needs a replicated output projection under tensor split
-    // (the DSpark drafter's in-graph vocabulary-global argmax) sets this in
-    // common_model_params_to_llama before the model loads.
-    const char * env = getenv("LLAMA_TENSOR_MIRROR_OUTPUT");
-    return env != nullptr && atoi(env) != 0;
+    return pimpl->tensor_mirror_output;
 }
 
 uint32_t llama_model::n_gpu_layers() const {

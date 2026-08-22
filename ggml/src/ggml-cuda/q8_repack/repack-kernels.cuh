@@ -765,14 +765,26 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
 // weights once and keeping one accumulator per token amortizes the weight
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
+          int LANES = 64>
 static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
-        const uint32_t xs, const uint32_t ys) {
+        const uint32_t xs, const uint32_t ys,
+        const uint8_t * __restrict__ wbase_gate, const float * __restrict__ x_bias,
+        const float * __restrict__ gate_bias, const ggml_glu_op glu_op,
+        const uint32_t bias_row_base) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    constexpr int LANES = 64;
-    static_assert(ROWS == NWAVES * RPL, "row geometry");
+    // LANES is the number of lanes cooperating on ONE row. It is the geometry
+    // knob that matters here: the strided loop runs n_blocks/LANES iterations
+    // and is then followed by a log2(LANES)-step DPP reduction, so a wide lane
+    // group on a short row spends most of its time reducing. At ne0=5120,
+    // n_blocks is 160, which is 2.5 iterations at 64 lanes against a 6-step
+    // reduction, and 10 iterations at 16 lanes against a 4-step one.
+    constexpr int NWARPS = (NWAVES * 64) / LANES;
+    static_assert(LANES >= 1 && LANES <= 64 && (LANES & (LANES - 1)) == 0,
+                  "LANES must be a power of two, at most one wave");
+    static_assert(ROWS == NWARPS * RPL, "row geometry");
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
     const int row     = blockIdx.x * ROWS + warp_id * RPL;
@@ -798,7 +810,26 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         rmasks[r] = (rr < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
     }
 
+    // Fused FFN: the gate matrix is read in the same pass as up, so the
+    // activation blocks, the row bookkeeping and the launch are all shared.
+    // Widths 2-8 otherwise run up, gate and the GLU as three launches where
+    // the canonical path runs one.
+    constexpr int GR = HAS_FUSION ? RPL   : 1;
+    constexpr int GC = HAS_FUSION ? NCOLS : 1;
+    [[maybe_unused]] const uint4    * wg_rows[GR];
+    [[maybe_unused]] const uint16_t * dg_rows[GR];
+    if constexpr (HAS_FUSION) {
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            const uint32_t wrow = min((uint32_t)(row + r), ne1 - 1);
+            wg_rows[r] = reinterpret_cast<const uint4 *>(wbase_gate + (size_t) wrow * qs_str);
+            dg_rows[r] = reinterpret_cast<const uint16_t *>(
+                wbase_gate + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
+        }
+    }
+
     float acc[RPL][NCOLS] = {};
+    [[maybe_unused]] float accg[GR][GC] = {};
 
     // Whole 32-quant blocks per lane step: one weight-scale read and one
     // activation block per column per 32 quants. The half-block stride paid
@@ -817,6 +848,17 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
             const uint16_t db = d_rows[r][sb] & rmasks[r];
             dw[r] = __half2float(*reinterpret_cast<const __half *>(&db));
         }
+        [[maybe_unused]] uint4 gv0[GR], gv1[GR];
+        [[maybe_unused]] float dg[GR];
+        if constexpr (HAS_FUSION) {
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                gv0[r] = wg_rows[r][sb * 2u];
+                gv1[r] = wg_rows[r][sb * 2u + 1u];
+                const uint16_t gb = dg_rows[r][sb] & rmasks[r];
+                dg[r] = __half2float(*reinterpret_cast<const __half *>(&gb));
+            }
+        }
 #pragma unroll
         for (int c = 0; c < NCOLS; ++c) {
             const block_q8_1 * xb = xq + (size_t) c * xs + sb;
@@ -834,6 +876,18 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
                 idot = ggml_cuda_dp4a((int) wv1[r].z, x[6], idot);
                 idot = ggml_cuda_dp4a((int) wv1[r].w, x[7], idot);
                 acc[r][c] += dw[r] * dx * (float) idot;
+                if constexpr (HAS_FUSION) {
+                    int gdot = 0;
+                    gdot = ggml_cuda_dp4a((int) gv0[r].x, x[0], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv0[r].y, x[1], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv0[r].z, x[2], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv0[r].w, x[3], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv1[r].x, x[4], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv1[r].y, x[5], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv1[r].z, x[6], gdot);
+                    gdot = ggml_cuda_dp4a((int) gv1[r].w, x[7], gdot);
+                    accg[r][c] += dg[r] * dx * (float) gdot;
+                }
             }
         }
     }
@@ -843,31 +897,42 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
 #pragma unroll
         for (int c = 0; c < NCOLS; ++c) {
             const float a = rp_warp_reduce_sum<LANES>(acc[r][c]);
+            [[maybe_unused]] float g = 0.0f;
+            if constexpr (HAS_FUSION) {
+                g = rp_warp_reduce_sum<LANES>(accg[r][c]);
+            }
             if (lane == 0 && (row + r) < (int) ne1) {
-                y[(size_t) c * ys + row + r] = a;
+                float out = a;
+                if constexpr (HAS_FUSION) {
+                    out = rp_mmv_fusion_epilogue(a, g, x_bias, gate_bias,
+                        bias_row_base + (uint32_t)(row + r), glu_op, true);
+                }
+                y[(size_t) c * ys + row + r] = out;
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys,
+                     wbase_gate, x_bias, gate_bias, glu_op, bias_row_base);
     NO_DEVICE_CODE;
 #endif
 }
 
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64>
 static __global__ void mul_mat_vec_q8_0_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL>(
-        wbase, xq, y, ne0, ne1, xs, ys);
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES>(
+        wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
+        GGML_GLU_OP_REGLU, 0);
 }
 
 // MoE narrow batch: one assignment per block, one launch for all of them.
 // Expert token counts are per expert, so at verify widths nearly every active
 // expert holds a single assignment and the 32-wide tile computes 32 columns to
-// serve it. tile_meta built with BN=1 gives each block its expert and its
-// assignment index; ids_src1/ids_dst give the source and destination rows.
+// serve it. Each block resolves its own expert from expert_bounds below, and
+// ids_src1/ids_dst give the source and destination rows.
 // Which expert owns assignment a. expert_bounds is the monotonic per-expert
 // start offset, so this is an upper_bound minus one - cheap enough per block
 // that building a metadata array up front is not worth a kernel launch.
@@ -896,14 +961,43 @@ static __global__ void mul_mat_vec_q8_0_repacked_id1(
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const uint32_t a = blockIdx.y;
     const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL>(
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false>(
         wbase + (size_t) e * expert_stride,
         xq + (size_t) ids_src1[a] * xs,
         y  + (size_t) ids_dst[a]  * ys,
-        ne0, ne1, xs, ys);
+        ne0, ne1, xs, ys, nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU, 0);
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds,
                      n_expert, expert_stride, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Fused MoE narrow batch: one assignment per block, up and gate in one pass.
+// The ADD_ID bias is [ne1, n_expert], so the row index carries the expert.
+template <int ROWS, int NWAVES, int RPL = 1>
+static __global__ void mul_mat_vec_q8_0_repacked_id1_fused(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const size_t expert_stride, const uint32_t xs, const uint32_t ys,
+        const uint8_t * __restrict__ wbase_gate, const float * __restrict__ x_bias,
+        const float * __restrict__ gate_bias, const ggml_glu_op glu_op) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    const uint32_t a = blockIdx.y;
+    const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL, true>(
+        wbase + (size_t) e * expert_stride,
+        xq + (size_t) ids_src1[a] * xs,
+        y  + (size_t) ids_dst[a]  * ys,
+        ne0, ne1, xs, ys,
+        wbase_gate + (size_t) e * expert_stride,
+        x_bias, gate_bias, glu_op, e * ne1);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds,
+                     n_expert, expert_stride, xs, ys,
+                     wbase_gate, x_bias, gate_bias, glu_op);
     NO_DEVICE_CODE;
 #endif
 }

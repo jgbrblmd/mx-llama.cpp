@@ -110,16 +110,51 @@ static void ggml_cuda_mul_mat_repacked_nc(const ggml_tensor * src0,
     // workgroups spread over the CUs win. Two rows per lane reuse the
     // activation block across rows and pay from 3 tokens up; at 2 there is
     // too little to amortize, and 4 rows spills.
+    // Lane width per row, chosen from the ROW LENGTH and the batch width.
+    //
+    // LANES is the number of lanes cooperating on one row. The strided loop
+    // runs ne0/32/LANES iterations and is followed by a log2(LANES)-step DPP
+    // reduction, so the useful knob is how much work a lane gets before it has
+    // to reduce. Narrowing the lane group raises that, and raises occupancy,
+    // but it also cuts the block count that hides memory latency.
+    //
+    // Which effect wins is decided by the row length, and two models disagree
+    // about the batch width alone, so that is the wrong axis. Measured pp512
+    // at the ubatch, 2x MI50 -sm layer, narrow-lane against the 64-lane shape:
+    //
+    //                       ne0    K-blocks   width 2   width 3
+    //   Qwen3.6-27B        5120       160      +13.8%    +2.1%
+    //   Qwen3.6-35B-A3B    2048        64       -9.5%    -0.7%
+    //
+    // A 2048-wide row is 64 K-blocks, so splitting it over 16 lanes leaves 4
+    // iterations against a 4-step reduction while cutting the grid by 16x -
+    // the row is simply too short to pay for the lost parallelism. Gate on the
+    // block count so the choice follows the shape and not the model.
+    const bool long_row = (ne00 / 32) >= 128;
     switch (ne11) {
         case 2: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_q8_0_repacked_nc<2, 2, 2, 1><<<grid, 128, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (long_row) {
+                // 16 lanes to a row, 32 rows per block, one row per lane.
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_q8_0_repacked_nc<32, 8, 2, 1, 16><<<grid, 512, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_q8_0_repacked_nc<2, 2, 2, 1><<<grid, 128, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 3: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_q8_0_repacked_nc<2, 1, 3, 2><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (long_row) {
+                // 32 lanes to a row, 8 rows per block, one row per lane.
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_q8_0_repacked_nc<8, 4, 3, 1, 32><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_q8_0_repacked_nc<2, 1, 3, 2><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 4: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
