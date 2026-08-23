@@ -613,7 +613,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-// #pragma unroll
+#if defined(__gfx906__) && (type == GGML_TYPE_NVFP4)
+    // gfx906 (VEGA20): same unroll strategy as Q8_0 on gfx906 - reduces address
+    // computations per dot product. NVFP4 has headroom (fewer VGPRs than Q8_0)
+    // and can afford the partial unroll without spilling.
+    #pragma unroll 2
+#endif // defined(__gfx906__) && NVFP4
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
         const int k0 = k00 + k01;
 
