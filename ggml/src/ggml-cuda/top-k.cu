@@ -50,6 +50,20 @@ static int next_power_of_2(int x) {
 
 #ifndef GGML_CUDA_USE_CUB
 
+static void top_k_remember_row_chunking(ggml_backend_cuda_context & ctx,
+                                        const int64_t ncols,
+                                        const int64_t nrows,
+                                        const int64_t chunk_nrows) {
+    if (ctx.top_k_workspace_rows_cap == 0 || chunk_nrows < ctx.top_k_workspace_rows_cap) {
+        ctx.top_k_workspace_rows_cap = chunk_nrows;
+    }
+    if (!ctx.top_k_workspace_rows_cap_logged) {
+        GGML_LOG_INFO("CUDA top-k: workspace pressure, splitting %lld rows into chunks of %lld (columns = %lld)\n",
+                      (long long) nrows, (long long) chunk_nrows, (long long) ncols);
+        ctx.top_k_workspace_rows_cap_logged = true;
+    }
+}
+
 // Hierarchical top-k for rows wider than the shared-memory bitonic limit.
 // The row is cut into <= 16384-column segments, the existing bitonic sorts
 // each segment (staged packed so the row stride matches), the per-segment
@@ -209,7 +223,7 @@ static bool top_k_small_cuda(const float * src, int * dst, const int64_t ncols,
     return true;
 }
 
-static void top_k_hierarchical(ggml_cuda_pool & pool,
+static void top_k_hierarchical(ggml_backend_cuda_context & ctx,
                                const float *    src,
                                int *            dst,
                                const int64_t    ncols,
@@ -219,37 +233,73 @@ static void top_k_hierarchical(ggml_cuda_pool & pool,
     constexpr int SEGW = 16384;
     const int n_seg  = (int) ((ncols + SEGW - 1) / SEGW);
     const int n_cand = (int) (n_seg * k);
+    ggml_cuda_pool & pool = ctx.pool();
 
-    ggml_cuda_pool_alloc<float> seg_vals_alloc(pool, (int64_t) SEGW * nrows);
-    ggml_cuda_pool_alloc<int>   seg_sorted_alloc(pool, (int64_t) SEGW * nrows);
-    ggml_cuda_pool_alloc<float> cand_val_alloc(pool, (int64_t) n_cand * nrows);
-    ggml_cuda_pool_alloc<int>   cand_idx_alloc(pool, (int64_t) n_cand * nrows);
-    ggml_cuda_pool_alloc<int>   pos_alloc(pool, (int64_t) n_cand * nrows);
+    ggml_cuda_pool_alloc<float> seg_vals_alloc(pool);
+    ggml_cuda_pool_alloc<int>   seg_sorted_alloc(pool);
+    ggml_cuda_pool_alloc<float> cand_val_alloc(pool);
+    ggml_cuda_pool_alloc<int>   cand_idx_alloc(pool);
+    ggml_cuda_pool_alloc<int>   pos_alloc(pool);
 
-    const dim3 block(256, 1, 1);
-    const dim3 grid((unsigned) ((k + 255) / 256), (unsigned) nrows, 1);
+    int64_t chunk_nrows = ctx.top_k_workspace_rows_cap > 0 ?
+        std::min(nrows, ctx.top_k_workspace_rows_cap) : nrows;
+    while (true) {
+        const bool allocated =
+            seg_vals_alloc.try_alloc((int64_t) SEGW * chunk_nrows) != nullptr &&
+            seg_sorted_alloc.try_alloc((int64_t) SEGW * chunk_nrows) != nullptr &&
+            cand_val_alloc.try_alloc((int64_t) n_cand * chunk_nrows) != nullptr &&
+            cand_idx_alloc.try_alloc((int64_t) n_cand * chunk_nrows) != nullptr &&
+            pos_alloc.try_alloc((int64_t) n_cand * chunk_nrows) != nullptr;
+        if (allocated) {
+            break;
+        }
 
-    for (int seg = 0; seg < n_seg; seg++) {
-        const int seg_off = seg * SEGW;
-        const int seg_len = (int) std::min<int64_t>(SEGW, ncols - seg_off);
-        const int kk      = (int) std::min<int64_t>(k, seg_len);
+        // VMM allocations must be released in reverse order.
+        pos_alloc.reset();
+        cand_idx_alloc.reset();
+        cand_val_alloc.reset();
+        seg_sorted_alloc.reset();
+        seg_vals_alloc.reset();
 
-        // pack the segment so the bitonic's row stride matches its ncols
-        CUDA_CHECK(cudaMemcpy2DAsync(seg_vals_alloc.get(), seg_len * sizeof(float),
-                                     src + seg_off, ncols * sizeof(float),
-                                     seg_len * sizeof(float), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-        argsort_f32_i32_cuda_bitonic(seg_vals_alloc.get(), seg_sorted_alloc.get(),
-                                     seg_len, nrows, GGML_SORT_ORDER_DESC, stream);
-        k_topk_gather_candidates<<<grid, block, 0, stream>>>(
-            src, seg_sorted_alloc.get(), cand_val_alloc.get(), cand_idx_alloc.get(),
-            ncols, seg_len, seg_off, kk, n_cand, seg * (int) k, (int) k);
+        if (chunk_nrows == 1) {
+            GGML_ABORT("CUDA top-k: failed to allocate the minimum hierarchical workspace");
+        }
+        chunk_nrows = (chunk_nrows + 1) / 2;
     }
 
-    argsort_f32_i32_cuda_bitonic(cand_val_alloc.get(), pos_alloc.get(),
-                                 n_cand, nrows, GGML_SORT_ORDER_DESC, stream);
-    k_topk_remap<<<grid, block, 0, stream>>>(
-        pos_alloc.get(), cand_idx_alloc.get(), dst, n_cand, (int) k);
+    if (chunk_nrows != nrows) {
+        top_k_remember_row_chunking(ctx, ncols, nrows, chunk_nrows);
+    }
+
+    const dim3 block(256, 1, 1);
+
+    for (int64_t row = 0; row < nrows; row += chunk_nrows) {
+        const int64_t iter_nrows = std::min(chunk_nrows, nrows - row);
+        const dim3 grid((unsigned) ((k + 255) / 256), (unsigned) iter_nrows, 1);
+        const float * src_chunk = src + row * ncols;
+
+        for (int seg = 0; seg < n_seg; seg++) {
+            const int seg_off = seg * SEGW;
+            const int seg_len = (int) std::min<int64_t>(SEGW, ncols - seg_off);
+            const int kk      = (int) std::min<int64_t>(k, seg_len);
+
+            // Pack the segment so the bitonic row stride matches its ncols.
+            CUDA_CHECK(cudaMemcpy2DAsync(seg_vals_alloc.get(), seg_len * sizeof(float),
+                                         src_chunk + seg_off, ncols * sizeof(float),
+                                         seg_len * sizeof(float), iter_nrows,
+                                         cudaMemcpyDeviceToDevice, stream));
+            argsort_f32_i32_cuda_bitonic(seg_vals_alloc.get(), seg_sorted_alloc.get(),
+                                         seg_len, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+            k_topk_gather_candidates<<<grid, block, 0, stream>>>(
+                src_chunk, seg_sorted_alloc.get(), cand_val_alloc.get(), cand_idx_alloc.get(),
+                ncols, seg_len, seg_off, kk, n_cand, seg * (int) k, (int) k);
+        }
+
+        argsort_f32_i32_cuda_bitonic(cand_val_alloc.get(), pos_alloc.get(),
+                                     n_cand, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+        k_topk_remap<<<grid, block, 0, stream>>>(
+            pos_alloc.get(), cand_idx_alloc.get(), dst + row * k, n_cand, (int) k);
+    }
 }
 
 #endif // !GGML_CUDA_USE_CUB
@@ -306,13 +356,29 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (top_k_small_cuda(src0_d, dst_d, ncols, nrows, k, stream)) {
         // done
     } else if (ncols <= 16384) {
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool);
+        int64_t chunk_nrows = ctx.top_k_workspace_rows_cap > 0 ?
+            std::min(nrows, ctx.top_k_workspace_rows_cap) : nrows;
+        while (temp_dst_alloc.try_alloc(ncols * chunk_nrows) == nullptr) {
+            if (chunk_nrows == 1) {
+                GGML_ABORT("CUDA top-k: failed to allocate the minimum sort workspace");
+            }
+            chunk_nrows = (chunk_nrows + 1) / 2;
+        }
+        if (chunk_nrows != nrows) {
+            top_k_remember_row_chunking(ctx, ncols, nrows, chunk_nrows);
+        }
+
         int *                     tmp_dst = temp_dst_alloc.get();
-        argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+        for (int64_t row = 0; row < nrows; row += chunk_nrows) {
+            const int64_t iter_nrows = std::min(chunk_nrows, nrows - row);
+            argsort_f32_i32_cuda_bitonic(src0_d + row * ncols, tmp_dst, ncols, iter_nrows,
+                                         GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(dst_d + row * k, k * sizeof(int), tmp_dst, ncols * sizeof(int),
+                                         k * sizeof(int), iter_nrows, cudaMemcpyDeviceToDevice, stream));
+        }
     } else {
-        top_k_hierarchical(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_hierarchical(ctx, src0_d, dst_d, ncols, nrows, k, stream);
     }
 #endif
 }

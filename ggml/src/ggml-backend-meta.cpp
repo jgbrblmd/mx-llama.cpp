@@ -2336,6 +2336,7 @@ struct ggml_backend_meta_context {
     bool dbg_run  = false; // GGML_META_RUN_DEBUG  (per graph_compute)
     bool dbg_xfer = false; // GGML_META_XFER_DEBUG (per stage_transfer)
     bool dbg_chunk = false; // GGML_META_CHUNK_TRACE (entry/exit stamp per graph_compute)
+    bool layer_seam_cost = true; // GGML_META_LAYER_SEAM_COST (default on)
 
     // Concurrent per-lane graph dispatch. On by default, GGML_META_PARALLEL_DISPATCH=0
     // restores the serial per-lane issue.
@@ -2590,6 +2591,7 @@ struct ggml_backend_meta_context {
         dbg_run  = env_flag("GGML_META_RUN_DEBUG");
         dbg_xfer = env_flag("GGML_META_XFER_DEBUG");
         dbg_chunk = env_flag("GGML_META_CHUNK_TRACE");
+        layer_seam_cost = env_flag_on("GGML_META_LAYER_SEAM_COST");
 
         // On by default, and only does anything with more than one lane per stage.
         //
@@ -2630,6 +2632,14 @@ struct ggml_backend_meta_context {
 
     ~ggml_backend_meta_context() {
         prof_report();
+
+        // Captured graph executables are owned by their simple backends. Release
+        // them while those backends (and their CUDA/HIP contexts) are still alive.
+        for (auto & entry : tg_cache) {
+            tg_free_entry(entry);
+        }
+        tg_cache.clear();
+
         ggml_backend_comm_free_t comm_free = nullptr;
         if (xfer_comm_ctx != nullptr) {
             comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -2841,7 +2851,6 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2866,7 +2875,8 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
+                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j,
+                    i_start * chunk_size_j, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
@@ -3164,17 +3174,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // stage seam can avoid splitting a layer between its cache writes and
             // the reads of those same rows. Without this the seam can land
             // mid-attention and the whole cache layer has to be relayed.
+            auto view_root = [](const ggml_tensor * t) -> const ggml_tensor * {
+                while (t != nullptr && t->view_src != nullptr) {
+                    t = t->view_src;
+                }
+                return t;
+            };
             std::unordered_map<const ggml_tensor *, int> persist_first_write;
             std::unordered_map<const ggml_tensor *, int> persist_last_read;
             if (backend_ctx->n_stages > 1) {
-                auto vroot = [](const ggml_tensor * t) -> const ggml_tensor * {
-                    while (t != nullptr && t->view_src != nullptr) t = t->view_src;
-                    return t;
-                };
                 for (int i = 0; i < cgraph->n_nodes; i++) {
                     ggml_tensor * nd = cgraph->nodes[i];
                     if (nd->view_src != nullptr) {
-                        const ggml_tensor * rt = vroot(nd);
+                        const ggml_tensor * rt = view_root(nd);
                         if (rt != nullptr && rt->buffer != nullptr &&
                                 ggml_backend_buffer_get_usage(rt->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
                             auto it = persist_first_write.find(rt);
@@ -3184,7 +3196,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
                         const ggml_tensor * s = nd->src[sx];
                         if (s == nullptr) continue;
-                        const ggml_tensor * rt = vroot(s);
+                        const ggml_tensor * rt = view_root(s);
                         if (rt == nullptr || rt->buffer == nullptr) continue;
                         if (ggml_backend_buffer_get_usage(rt->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) continue;
                         if (ggml_backend_buffer_get_usage(rt->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
@@ -3192,6 +3204,127 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
             }
+
+            // Build the dependency index before choosing stage boundaries. The same
+            // collector is used both to price candidate seams and, after partitioning,
+            // to populate the transfer sets. Keeping one implementation guarantees that
+            // the cost comparison includes persistent-buffer dependencies exactly as the
+            // execution path will transfer them.
+            std::unordered_map<const ggml_tensor *, int> xfer_node_index;
+            xfer_node_index.reserve((size_t) cgraph->n_nodes * 2);
+            std::unordered_map<const ggml_tensor *, std::vector<int>> xfer_buffer_writers;
+            for (int ii = 0; ii < cgraph->n_nodes; ii++) {
+                ggml_tensor * nd = cgraph->nodes[ii];
+                xfer_node_index[nd] = ii;
+                if (nd->view_src == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * root = view_root(nd);
+                if (root == nullptr || root->buffer == nullptr ||
+                        ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                    continue;
+                }
+                xfer_buffer_writers[root].push_back(ii);
+            }
+
+            auto collect_xfer_set = [&](int boundary_idx) {
+                std::vector<ggml_tensor *> result;
+                std::unordered_set<ggml_tensor *> seen;
+                for (int k = boundary_idx; k < cgraph->n_nodes; k++) {
+                    ggml_tensor * node = cgraph->nodes[k];
+                    for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                        ggml_tensor * src = node->src[sx];
+                        if (src == nullptr) {
+                            continue;
+                        }
+                        const auto it = xfer_node_index.find(src);
+                        if (it == xfer_node_index.end()) {
+                            const ggml_tensor * root = view_root(src);
+                            const auto wit = xfer_buffer_writers.find(root);
+                            if (wit == xfer_buffer_writers.end()) {
+                                continue;
+                            }
+                            for (int widx : wit->second) {
+                                if (widx >= boundary_idx) {
+                                    continue;
+                                }
+                                ggml_tensor * wnode = cgraph->nodes[widx];
+                                if (!seen.insert(wnode).second) {
+                                    continue;
+                                }
+                                const ggml_backend_meta_split_state wss =
+                                    ggml_backend_meta_get_split_state(wnode, /*assume_sync =*/ true);
+                                if (wss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                                    result.push_back(wnode);
+                                }
+                            }
+                            continue;
+                        }
+                        if (it->second >= boundary_idx || !seen.insert(src).second) {
+                            continue;
+                        }
+                        const ggml_backend_meta_split_state ss =
+                            ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
+                        if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            result.push_back(src);
+                        }
+                    }
+                }
+                return result;
+            };
+
+            // Derive the transfer set for an earlier boundary from the already-built
+            // later-boundary set. collect_xfer_set scans future consumers in order, so
+            // scanning only [early, late) and then appending the filtered later set
+            // produces the same order and membership as a full collect at early.
+            auto derive_earlier_xfer_set = [&](const std::vector<ggml_tensor *> & later_set,
+                                               int early, int late) {
+                std::vector<ggml_tensor *> result;
+                std::unordered_set<ggml_tensor *> seen;
+                auto include = [&](ggml_tensor * tensor) {
+                    const auto it = xfer_node_index.find(tensor);
+                    if (it == xfer_node_index.end() || it->second >= early ||
+                            !seen.insert(tensor).second) {
+                        return;
+                    }
+                    const ggml_backend_meta_split_state ss =
+                        ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+                    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        result.push_back(tensor);
+                    }
+                };
+                for (int k = early; k < late; k++) {
+                    ggml_tensor * node = cgraph->nodes[k];
+                    for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                        ggml_tensor * src = node->src[sx];
+                        if (src == nullptr) {
+                            continue;
+                        }
+                        const auto it = xfer_node_index.find(src);
+                        if (it != xfer_node_index.end()) {
+                            include(src);
+                            continue;
+                        }
+                        const ggml_tensor * root = view_root(src);
+                        const auto wit = xfer_buffer_writers.find(root);
+                        if (wit == xfer_buffer_writers.end()) {
+                            continue;
+                        }
+                        for (int widx : wit->second) {
+                            if (widx >= early) {
+                                continue;
+                            }
+                            include(cgraph->nodes[widx]);
+                        }
+                    }
+                }
+                for (ggml_tensor * tensor : later_set) {
+                    include(tensor);
+                }
+                return result;
+            };
+
+            std::unordered_map<int, std::vector<ggml_tensor *>> planned_xfer_sets;
 
             // A graph with no owned node anywhere cannot derive a stage from its
             // own contents, so every node inherits the walk's initial stage and any
@@ -3254,15 +3387,63 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // the relay clobbered the new stage's freshly written state).
                     // Rewind until no buffer has a write before and a read after the
                     // evolving seam position.
-                    int snap_to = i;
-                    for (bool changed = true; changed; ) {
-                        changed = false;
-                        for (const auto & kv : persist_first_write) {
-                            const int w = kv.second;
-                            if (w < i_start || w >= snap_to) continue;
-                            const auto it_r = persist_last_read.find(kv.first);
-                            if (it_r == persist_last_read.end() || it_r->second < snap_to) continue;
-                            if (w < snap_to) { snap_to = w; changed = true; }
+                    auto rewind_persistent = [&](int boundary) {
+                        for (bool changed = true; changed; ) {
+                            changed = false;
+                            for (const auto & kv : persist_first_write) {
+                                const int w = kv.second;
+                                if (w < i_start || w >= boundary) continue;
+                                const auto it_r = persist_last_read.find(kv.first);
+                                if (it_r == persist_last_read.end() || it_r->second < boundary) continue;
+                                if (w < boundary) { boundary = w; changed = true; }
+                            }
+                        }
+                        return boundary;
+                    };
+
+                    int snap_to = rewind_persistent(i);
+
+                    // Hyperconnection graphs can expose the next stage only after a
+                    // substantial prefix of the next layer. The layer input is marked by
+                    // l_last-N at the start of the block. Price that true layer seam using
+                    // the exact transfer-set collector and select it only when it reduces
+                    // bytes (then operation count). Decode shapes therefore remain on the
+                    // established boundary whenever moving the seam would relay HCA state.
+                    const ggml_tensor * first = cgraph->nodes[i_start];
+                    // Transfer bytes are the dominant cost for prompt-sized graphs.
+                    // Decode and speculative-verify graphs are too narrow for that
+                    // metric alone: moving their seam can save a small copy while
+                    // worsening stage balance. Keep their established boundary.
+                    if (backend_ctx->layer_seam_cost && ggml_nrows(first) > 16 && i_start + 1 < i &&
+                            std::strncmp(first->name, "l_last-", 7) == 0) {
+                        const int candidate = rewind_persistent(i_start + 1);
+                        if (candidate < snap_to) {
+                            const int current = snap_to;
+                            auto current_set   = collect_xfer_set(current);
+                            auto candidate_set = derive_earlier_xfer_set(current_set, candidate, current);
+                            auto xfer_cost = [](const std::vector<ggml_tensor *> & xfer) {
+                                size_t bytes = 0;
+                                for (const ggml_tensor * tensor : xfer) {
+                                    bytes += ggml_nbytes(tensor);
+                                }
+                                return std::make_pair(bytes, xfer.size());
+                            };
+                            const auto current_cost   = xfer_cost(current_set);
+                            const auto candidate_cost = xfer_cost(candidate_set);
+                            if (candidate_cost < current_cost) {
+                                snap_to = candidate;
+                                planned_xfer_sets.emplace(candidate, std::move(candidate_set));
+                            } else {
+                                planned_xfer_sets.emplace(current, std::move(current_set));
+                            }
+                            if (backend_ctx->dbg_part) {
+                                fprintf(stderr,
+                                        "[meta-seam] uid=%zu rows=%lld stage=%d->%d current=%d bytes=%zu ops=%zu "
+                                        "candidate=%d bytes=%zu ops=%zu selected=%d\n",
+                                        (size_t) cgraph->uid, (long long) ggml_nrows(first), current_stage, n_stage,
+                                        current, current_cost.first, current_cost.second,
+                                        candidate, candidate_cost.first, candidate_cost.second, snap_to);
+                            }
                         }
                     }
                     if (snap_to >= i_start && snap_to < i) {
@@ -3457,14 +3638,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // tensors (e.g. l_out-N) are produced earlier in the same subgraph but consumed
             // by the next stage's residual ADDs.
             {
-                // Map each cgraph node to its index for cheap "is this an earlier node" lookups.
-                // unordered_map / unordered_set chosen over std::map / std::set for O(1) lookups.
-                std::unordered_map<const ggml_tensor *, int> node_index;
-                node_index.reserve((size_t) cgraph->n_nodes * 2);
-                for (int ii = 0; ii < cgraph->n_nodes; ii++) {
-                    node_index[cgraph->nodes[ii]] = ii;
-                }
-
                 // Dependencies that flow through a persistent buffer instead of an src edge.
                 // A KV-cache write is a SET_ROWS node writing through a view of the cache; the
                 // matching read is a separate view of the same cache. No src edge links them,
@@ -3477,29 +3650,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // perplexity: head-splitting attn_q_b makes an attention weight stage-1-owned,
                 // which moves the transition from node 4592 to 4482, in between two writes to
                 // cache_k_l22 and the view that reads them back.
-                auto view_root = [](const ggml_tensor * t) -> const ggml_tensor * {
-                    while (t != nullptr && t->view_src != nullptr) {
-                        t = t->view_src;
-                    }
-                    return t;
-                };
-                std::unordered_map<const ggml_tensor *, std::vector<int>> buffer_writers;
-                for (int ii = 0; ii < cgraph->n_nodes; ii++) {
-                    ggml_tensor * nd = cgraph->nodes[ii];
-                    if (nd->view_src == nullptr) {
-                        continue;   // not an in-place write through a view
-                    }
-                    const ggml_tensor * root = view_root(nd);
-                    if (root == nullptr || root->buffer == nullptr) {
-                        continue;
-                    }
-                    // Only persistent buffers matter. A compute-buffer root lives and dies
-                    // inside one graph and is reached through ordinary src edges anyway.
-                    if (ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-                        continue;
-                    }
-                    buffer_writers[root].push_back(ii);
-                }
                 for (size_t s = 0; s < n_subgraphs; s++) {
                     if (backend_ctx->subgraphs[s].closure != ggml_backend_meta_context::subgraph_closure::TRANSFER) {
                         continue;
@@ -3507,49 +3657,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const int boundary_idx = (s + 1 < n_subgraphs)
                         ? backend_ctx->backend_configs[0].cgraphs[s + 1].offset
                         : cgraph->n_nodes;
-                    std::unordered_set<ggml_tensor *> seen;
-                    auto & xfer = backend_ctx->subgraphs[s].xfer;
-                    for (int k = boundary_idx; k < cgraph->n_nodes; k++) {
-                        ggml_tensor * node = cgraph->nodes[k];
-                        for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
-                            ggml_tensor * src = node->src[sx];
-                            if (src == nullptr) continue;
-                            auto it = node_index.find(src);
-                            if (it == node_index.end()) {
-                                // Not a graph node. It may still be a view of a persistent
-                                // buffer that an earlier node wrote - send those writes, or the
-                                // new stage reads a buffer its lanes never received.
-                                const ggml_tensor * root = view_root(src);
-                                if (root != nullptr) {
-                                    auto wit = buffer_writers.find(root);
-                                    if (wit != buffer_writers.end()) {
-                                        for (int widx : wit->second) {
-                                            if (widx >= boundary_idx) continue;
-                                            ggml_tensor * wnode = cgraph->nodes[widx];
-                                            if (!seen.insert(wnode).second) continue;
-                                            const ggml_backend_meta_split_state wss =
-                                                ggml_backend_meta_get_split_state(wnode, /*assume_sync =*/ true);
-                                            if (wss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                                                continue;
-                                            }
-                                            xfer.push_back(wnode);
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                            if (it->second >= boundary_idx) continue; // produced in/after the new stage
-                            if (!seen.insert(src).second) continue;
-                            // Only MIRRORED tensors need cross-stage broadcast. Sharded tensors
-                            // are stage-restricted (their non-zero ne[] is on the producer's
-                            // stage's lanes only) and stage-crossing them would require
-                            // reshuffling, which the model architecture should not do.
-                            const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
-                            if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                                continue;
-                            }
-                            xfer.push_back(src);
-                        }
+                    auto planned = planned_xfer_sets.find(boundary_idx);
+                    if (planned != planned_xfer_sets.end()) {
+                        backend_ctx->subgraphs[s].xfer = std::move(planned->second);
+                    } else {
+                        backend_ctx->subgraphs[s].xfer = collect_xfer_set(boundary_idx);
                     }
                 }
             }

@@ -766,7 +766,7 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
     ctx->initialized = false;
 }
 
-void tp_custom_ar_prepare(CustomARContext * ctx,
+bool tp_custom_ar_prepare(CustomARContext * ctx,
                           float ** input_ptrs,
                           float ** output_ptrs,
                           int64_t  n_elements,
@@ -821,13 +821,32 @@ void tp_custom_ar_prepare(CustomARContext * ctx,
 #endif
                 ctx->d_staging[rank] = nullptr;
             }
-#if defined(GGML_USE_HIP)
             void * ptr = nullptr;
-            CUDA_CHECK(hipExtMallocWithFlags(&ptr, need_bytes, hipDeviceMallocFinegrained));
-            ctx->d_staging[rank] = (float *) ptr;
+#if defined(GGML_USE_HIP)
+            const cudaError_t err = hipExtMallocWithFlags(&ptr, need_bytes, hipDeviceMallocFinegrained);
 #else
-            CUDA_CHECK(cudaMalloc(&ctx->d_staging[rank], need_bytes));
+            const cudaError_t err = cudaMalloc(&ptr, need_bytes);
 #endif
+            if (err == cudaErrorMemoryAllocation) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("TP custom AR: could not allocate %.2f MiB staging on device %d; "
+                              "falling back to the regular AllReduce path\n",
+                              need_bytes / (1024.0 * 1024.0), ctx->dev_ids[rank]);
+                for (int cleanup_rank = 0; cleanup_rank < ctx->nranks; cleanup_rank++) {
+                    ggml_cuda_set_device(ctx->dev_ids[cleanup_rank]);
+                    if (ctx->d_staging[cleanup_rank] != nullptr) {
+                        CUDA_CHECK(cudaFree(ctx->d_staging[cleanup_rank]));
+                        ctx->d_staging[cleanup_rank] = nullptr;
+                    }
+                    ctx->cached_ptrs[cleanup_rank] = nullptr;
+                }
+                ctx->staging_size  = 0;
+                ctx->staging_slots = 0;
+                *plan = {};
+                return false;
+            }
+            CUDA_CHECK(err);
+            ctx->d_staging[rank] = (float *) ptr;
         }
         ctx->staging_size  = need_bytes;
         ctx->staging_slots = need_slots;
@@ -918,6 +937,7 @@ void tp_custom_ar_prepare(CustomARContext * ctx,
         plan->outputs[rank] = output_ptrs[rank];
         plan->streams[rank] = streams    [rank];
     }
+    return true;
 }
 
 void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
@@ -966,17 +986,20 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
     dispatch(dispatch, std::integral_constant<int, kMaxRanks>{});
 }
 
-void tp_custom_ar_allreduce(CustomARContext * ctx,
+bool tp_custom_ar_allreduce(CustomARContext * ctx,
                             float ** input_ptrs,
                             float ** output_ptrs,
                             int64_t  n_elements,
                             int      nranks,
                             cudaStream_t * streams) {
     CustomARPlan plan;
-    tp_custom_ar_prepare(ctx, input_ptrs, output_ptrs, n_elements, nranks, streams, &plan);
+    if (!tp_custom_ar_prepare(ctx, input_ptrs, output_ptrs, n_elements, nranks, streams, &plan)) {
+        return false;
+    }
     for (int rank = 0; rank < nranks; rank++) {
         tp_custom_ar_launch_rank(&plan, rank);
     }
+    return true;
 }
 
 } // namespace ggml_cuda_tp

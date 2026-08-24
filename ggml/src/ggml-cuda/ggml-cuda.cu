@@ -500,6 +500,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
+            if (fallible) {
+                *actual_size = 0;
+                return nullptr;
+            }
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
@@ -509,11 +513,6 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
-        }
-        if (fallible && err == cudaErrorMemoryAllocation) {
-            (void) cudaGetLastError();
-            *actual_size = 0;
-            return nullptr;
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
@@ -584,7 +583,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc_impl(size_t size, size_t * actual_size, bool fallible) {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -596,6 +595,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
 
+            if (fallible && pool_size + reserve_size > CUDA_POOL_VMM_MAX_SIZE) {
+                *actual_size = 0;
+                return nullptr;
+            }
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
             // allocate more physical memory
@@ -604,7 +607,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            const CUresult create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (fallible && create_result == (CUresult) cudaErrorMemoryAllocation) {
+                *actual_size = 0;
+                return nullptr;
+            }
+            CU_CHECK(create_result);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -685,6 +693,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
 
         return ptr;
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, false);
+    }
+
+    void * try_alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, true);
     }
 
     void free(void * ptr, size_t size) override {
@@ -1229,9 +1245,14 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         streams[i]     = cuda_ctx->stream();
     }
 
-    ggml_cuda_tp::tp_custom_ar_prepare(
-        &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
-        &comm_ctx->ar_plan);
+    if (!ggml_cuda_tp::tp_custom_ar_prepare(
+            &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
+            &comm_ctx->ar_plan)) {
+        // Avoid retrying an allocation that already failed under a stable
+        // model/context footprint. The configured regular path remains valid.
+        comm_ctx->use_custom_ar = false;
+        return false;
+    }
 
     // Deferred to launch_rank so it is ordered after that lane's subgraph even
     // when prepare runs ahead of the lanes (fused dispatch).
@@ -1982,13 +2003,38 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     ggml_cuda_pool_alloc<cuda_t> src0_alloc(ctx.pool());
     ggml_cuda_pool_alloc<cuda_t> src1_alloc(ctx.pool());
 
+    auto alloc_with_cache_recovery = [&](auto & allocation, const size_t n_elements, const char * label) {
+        if (allocation.try_alloc(n_elements) != nullptr) {
+            return;
+        }
+
+        // Cached q8_1 activations are optional and their consuming kernels
+        // precede this operation on the same stream. Release them before a
+        // required BLAS conversion workspace is allowed to abort the graph.
+        if (!ctx.q8_1_cache.empty()) {
+            ctx.q8_1_cache.clear();
+            if (!ctx.q8_1_cache_pressure_logged) {
+                GGML_LOG_WARN("CUDA q8_1 cache[%d]: required BLAS %s workspace did not fit; releasing cached activations\n",
+                              ctx.device, label);
+                ctx.q8_1_cache_pressure_logged = true;
+            }
+            if (allocation.try_alloc(n_elements) != nullptr) {
+                return;
+            }
+        }
+
+        // Preserve the regular fail-fast diagnostic when no optional memory
+        // remains to recover.
+        allocation.alloc(n_elements);
+    };
+
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
-        src0_alloc.alloc(ggml_nelements(src0));
+        alloc_with_cache_recovery(src0_alloc, ggml_nelements(src0), "source-0 conversion");
 
         if (ggml_is_contiguously_allocated(src0)) {
             const auto convert_func = traits::convert(src0->type);
@@ -2013,7 +2059,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
-        src1_alloc.alloc(ggml_nelements(src1));
+        alloc_with_cache_recovery(src1_alloc, ggml_nelements(src1), "source-1 conversion");
 
         if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
@@ -2065,7 +2111,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
-            dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            alloc_with_cache_recovery(dst_temp, ne_dst, "output conversion");
+            dst_ptr = (char *) dst_temp.get();
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -2117,8 +2164,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
 
-        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
-        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool());
+        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool());
+        alloc_with_cache_recovery(ptrs_src, 2*ne23, "source pointer");
+        alloc_with_cache_recovery(ptrs_dst, 1*ne23, "destination pointer");
 
         const size_t src_type_size = sizeof(cuda_t);
 
@@ -2406,8 +2455,11 @@ static bool ggml_cuda_q8_1_cache_enabled() {
 char * ggml_cuda_q8_1_cache_acquire(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int variant,
         const int64_t ne_padded, const int64_t s11, const int64_t s12, const int64_t s13,
-        const size_t nbytes, bool & hit) {
+        const size_t nbytes, bool & hit, bool * pressure) {
     hit = false;
+    if (pressure) {
+        *pressure = false;
+    }
 
     if (!ggml_cuda_q8_1_cache_enabled() || !src1) {
         return nullptr;
@@ -2434,8 +2486,29 @@ char * ggml_cuda_q8_1_cache_acquire(
     }
 
     ggml_backend_cuda_context::q8_1_cache_entry e;
-    e.alloc     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
-    e.buf       = e.alloc->get();
+    e.alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool());
+    e.buf   = e.alloc->try_alloc(nbytes);
+
+    // A second cached activation is optional. Under memory pressure, release the
+    // least-recent entry and retry instead of turning this optimization into a
+    // fail-fast allocation. Reusing the released pool buffer remains ordered on
+    // the same stream, as described above.
+    while (!e.buf && !ctx.q8_1_cache.empty()) {
+        ctx.q8_1_cache.erase(ctx.q8_1_cache.begin());
+        if (!ctx.q8_1_cache_pressure_logged) {
+            GGML_LOG_WARN(GGML_CUDA_NAME " q8_1 cache[%d]: allocation did not fit; "
+                    "evicting a cached activation and retrying\n", ctx.device);
+            ctx.q8_1_cache_pressure_logged = true;
+        }
+        e.buf = e.alloc->try_alloc(nbytes);
+    }
+
+    if (!e.buf) {
+        if (pressure) {
+            *pressure = true;
+        }
+        return nullptr;
+    }
     e.src1      = src1;
     e.data      = src1->data;
     e.ne[0]     = src1->ne[0];
@@ -3538,7 +3611,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_try_instantiate(ggml_cuda_graph * graph) {
+    const cudaError_t stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+    if (stat == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        graph->instance = nullptr;
+        return false;
+    }
+    CUDA_CHECK(stat);
+    return true;
+}
+
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if defined(GGML_USE_HIP)
@@ -3577,8 +3661,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         GGML_LOG_DEBUG("%s: HIP: kernel set changed, re-instantiating graph exec\n", __func__);
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        return;
+        return ggml_cuda_graph_try_instantiate(graph);
     }
     {
         hipGraphNode_t errorNode;
@@ -3588,9 +3671,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             (void)hipGetLastError();
             CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
             graph->instance = nullptr;
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            return ggml_cuda_graph_try_instantiate(graph);
         }
     }
+    return true;
 #else
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3611,10 +3695,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return ggml_cuda_graph_try_instantiate(graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return true;
 #endif // defined(GGML_USE_HIP)
 }
 #endif // USE_CUDA_GRAPH
@@ -5309,10 +5394,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool graph_ready = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            graph_ready = ggml_cuda_graph_try_instantiate(graph);
         } else if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            graph_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (!graph_ready) {
+            GGML_LOG_WARN("%s: device %d graph executable did not fit, using direct execution for this graph\n",
+                    __func__, cuda_ctx->device);
+            if (graph->graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->graph = nullptr;
+            }
+            graph->disable_due_to_memory = true;
+
+            // Captured kernels did not execute. Drop any activation-cache entries
+            // they prepared before evaluating the graph directly.
+            cuda_ctx->q8_1_cache_reset();
+            ggml_cuda_graph_evaluate_and_capture(
+                    cuda_ctx, cgraph, false, false, graph_key);
+            return;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));

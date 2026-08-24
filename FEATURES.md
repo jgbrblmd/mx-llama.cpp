@@ -147,7 +147,10 @@ replicated per lane instead of split (a small dense drafter loses more to
 per-layer AllReduce than it gains from splitting), the no-vocab sidecar borrows
 the target tokenizer, and the target's output projection is replicated so every
 device holds the full logit row. Measured on DeepSeek-V4-Flash at `-tps 4` over
-8 GPUs: generation 18.0 to 27.3 t/s. Validated on gfx906.
+8 GPUs: generation 18.0 to 27.3 t/s. The target also stays unrepacked by default:
+on the same topology this raised draft acceptance from 63.8% to 83.5% and
+generation from 26.8 to 31.5 t/s without changing prefill throughput.
+`LLAMA_DSPARK_TARGET_REPACK=1` restores target repacking. Validated on gfx906.
 
 ## Allocation layout cache
 

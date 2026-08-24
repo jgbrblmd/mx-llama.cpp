@@ -1438,6 +1438,12 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     return false;
 }
 
+bool llama_kv_cache_dsv4::get_can_checkpoint() const {
+    // The compressed attention state cannot currently be restored losslessly
+    // from a partial sequence checkpoint.
+    return false;
+}
+
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows

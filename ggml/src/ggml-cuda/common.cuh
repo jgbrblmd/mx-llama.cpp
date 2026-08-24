@@ -1355,6 +1355,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_memory = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
@@ -1376,7 +1377,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || unstable_disabled || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_memory || unstable_disabled || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1553,6 +1554,19 @@ struct ggml_backend_cuda_context {
     // Remember a smaller split flash-attention workspace after an allocation failure.
     int fattn_parallel_blocks_cap = 0;
     bool fattn_parallel_blocks_override_logged = false;
+    // Preserve a working row chunk after TOP_K encounters memory pressure. Retrying
+    // the known-too-large allocation in every layer would force a device-wide pool
+    // flush and make deep prefill needlessly expensive.
+    int64_t top_k_workspace_rows_cap = 0;
+    bool top_k_workspace_rows_cap_logged = false;
+    // Maximum MMQ output columns known to fit its quantized-activation workspace.
+    // Zero keeps the original full-width path until actual memory pressure occurs.
+    int64_t mmq_workspace_cols_cap = 0;
+    bool mmq_workspace_cols_cap_logged = false;
+    int64_t mmq_id_workspace_tokens_cap = 0;
+    bool mmq_id_workspace_tokens_cap_logged = false;
+    int64_t repack_workspace_cols_cap = 0;
+    bool repack_workspace_cols_cap_logged = false;
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
@@ -1645,6 +1659,7 @@ struct ggml_backend_cuda_context {
     size_t q8_1_cache_hits   = 0;
     size_t q8_1_cache_misses = 0;
     size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
+    bool q8_1_cache_pressure_logged = false;
     void q8_1_cache_reset() {
         q8_1_cache.clear();
     }
@@ -1853,4 +1868,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 char * ggml_cuda_q8_1_cache_acquire(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int variant,
         int64_t ne_padded, int64_t s11, int64_t s12, int64_t s13,
-        size_t nbytes, bool & hit);
+        size_t nbytes, bool & hit, bool * pressure = nullptr);

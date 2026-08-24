@@ -78,24 +78,65 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // Multi-token: grouped MMQ Q8_1 layout for the tiled GEMM.
     const uint64_t n_groups   = (uint64_t) ne10_padded / (4 * QK8_1);
 
-    ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1(ctx.pool(),
-        ne13 * ne12 * ne11 * n_groups);
-    {
-        const int64_t s11 = src1->nb[1] / sizeof(float);
-        const int64_t s12 = src1->nb[2] / sizeof(float);
-        const int64_t s13 = src1->nb[3] / sizeof(float);
-        quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    int64_t chunk_ne11 = ctx.repack_workspace_cols_cap > 0 ?
+        std::min(ne11, ctx.repack_workspace_cols_cap) : ne11;
+    ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1(ctx.pool());
+    auto try_workspace = [&]() {
+        return src1_q8_1.try_alloc(ne13 * ne12 * chunk_ne11 * n_groups) != nullptr;
+    };
+
+    if (!try_workspace()) {
+        // Cached activation conversions are optional. Their consumers precede
+        // this operation on the same stream, so they can be released before a
+        // required repack conversion is split.
+        if (!ctx.q8_1_cache.empty()) {
+            ctx.q8_1_cache.clear();
+            if (!ctx.q8_1_cache_pressure_logged) {
+                GGML_LOG_WARN("CUDA q8_1 cache[%d]: repack workspace did not fit; releasing cached activations\n",
+                              ctx.device);
+                ctx.q8_1_cache_pressure_logged = true;
+            }
+        }
+
+        while (!try_workspace()) {
+            if (chunk_ne11 == 1) {
+                GGML_ABORT("CUDA repack: failed to allocate the minimum quantization workspace");
+            }
+            chunk_ne11 = (chunk_ne11 + 1) / 2;
+        }
     }
-    for (int64_t i3 = 0; i3 < ne13; i3++) {
-    for (int64_t i2 = 0; i2 < ne12; i2++) {
-        const block_q8_1_mmq_h * slice_base = src1_q8_1.get()
-                              + (i3 * ne12 + i2) * ne11 * n_groups;
-        const block_q8_1 * xq = reinterpret_cast<const block_q8_1 *>(slice_base);
-        float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
-        ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-            ne00, ne01, ne11, stream);
+
+    if (chunk_ne11 != ne11) {
+        if (ctx.repack_workspace_cols_cap == 0 || chunk_ne11 < ctx.repack_workspace_cols_cap) {
+            ctx.repack_workspace_cols_cap = chunk_ne11;
+        }
+        if (!ctx.repack_workspace_cols_cap_logged) {
+            GGML_LOG_WARN("CUDA repack: device %d workspace pressure, splitting %lld columns into chunks of %lld\n",
+                          ctx.device, (long long) ne11, (long long) chunk_ne11);
+            ctx.repack_workspace_cols_cap_logged = true;
+        }
     }
+
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    const int64_t s12 = src1->nb[2] / sizeof(float);
+    const int64_t s13 = src1->nb[3] / sizeof(float);
+    const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
+    for (int64_t col = 0; col < ne11; col += chunk_ne11) {
+        const int64_t iter_ne11 = std::min(chunk_ne11, ne11 - col);
+        quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
+            src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
+
+        for (int64_t i3 = 0; i3 < ne13; i3++) {
+        for (int64_t i2 = 0; i2 < ne12; i2++) {
+            const block_q8_1_mmq_h * slice_base = src1_q8_1.get()
+                                  + (i3 * ne12 + i2) * iter_ne11 * n_groups;
+            const block_q8_1 * xq = reinterpret_cast<const block_q8_1 *>(slice_base);
+            float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
+                           + col*dst_s1;
+            ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
+                ne00, ne01, iter_ne11, stream);
+        }
+        }
     }
 }
 

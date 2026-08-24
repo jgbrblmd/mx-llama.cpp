@@ -506,7 +506,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // DeepSeek-V4's output projection is a GROUPED LoRA: wo_a is applied per output
     // group and wo_b reduces the concatenated groups. With n_head/n_devices heads per
     // device the head split lands exactly on group boundaries, so a device owns whole
-    // groups. That makes wo_a a group-axis split (AXIS_1, a concatenation, no reduce)
+    // groups. That makes wo_a a group-axis split (AXIS_2, a concatenation, no reduce)
     // and wo_b the row-parallel step that produces PARTIAL and owes the all-reduce.
     // On by default. LLAMA_MLA_TP=0 falls back to mirroring the whole attention stack
     // and splitting only the experts, which is correct but leaves the attention mass
@@ -589,7 +589,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
             if (std::regex_match(tensor_name, pattern_mla_out_a)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
             if (std::regex_match(tensor_name, pattern_mla_out_b)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);

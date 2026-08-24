@@ -144,7 +144,8 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids = 
 // Destroy: free signal buffers and rank data.
 void tp_custom_ar_destroy(CustomARContext * ctx);
 
-// Launch the AllReduce on all devices.
+// Launch the AllReduce on all devices. Returns false without launching when
+// the custom staging allocation cannot be satisfied.
 //   input_ptrs[rank]  : input buffer on each rank (GEMM partial results)
 //   output_ptrs[rank] : output buffer on each rank (reduced result);
 //                       may alias input_ptrs[rank] — both kernels read through
@@ -152,7 +153,7 @@ void tp_custom_ar_destroy(CustomARContext * ctx);
 //   n_elements        : number of float elements per rank
 //   nranks            : number of GPUs (must be even, 2-8)
 //   streams[rank]     : CUDA/HIP stream per rank
-void tp_custom_ar_allreduce(CustomARContext * ctx,
+bool tp_custom_ar_allreduce(CustomARContext * ctx,
                             float ** input_ptrs,
                             float ** output_ptrs,
                             int64_t  n_elements,
@@ -190,7 +191,9 @@ struct CustomARPlan {
     bool              broadcast  = false;
 };
 
-void tp_custom_ar_prepare(CustomARContext * ctx,
+// Returns false when the staging allocation cannot be satisfied. No kernels
+// are launched in that case, so the caller can use its normal AllReduce path.
+bool tp_custom_ar_prepare(CustomARContext * ctx,
                           float ** input_ptrs,
                           float ** output_ptrs,
                           int64_t  n_elements,
