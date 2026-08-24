@@ -598,6 +598,7 @@ struct common_params {
 
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
+    ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
@@ -673,6 +674,7 @@ struct common_params {
 
     // enable built-in tools
     std::vector<std::string> server_tools;
+    std::string server_tools_runtime;
 
     // MCP server configs (Cursor-compatible JSON)
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
@@ -739,6 +741,12 @@ struct common_params {
     bool tokenize_stdin      = false; // if true, read the prompt from stdin
     bool tokenize_no_bos     = false; // if true, do not add the BOS token
     bool tokenize_show_count = false; // if true, print the total token count
+
+    // TTS
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
+
+    bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 
     // common params
     std::string out_file; // output filename for all example programs
@@ -882,6 +890,7 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
+std::string fs_get_config_directory();
 
 struct common_file_info {
     std::string path;
@@ -931,6 +940,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
+
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
@@ -938,6 +948,28 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 
 // model endpoint from env
 std::string common_get_model_endpoint();
+
+//
+// Threadpool utils
+//
+
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+struct common_threadpools {
+    common_threadpools() = default;
+    ~common_threadpools();
+
+    common_threadpools(const common_threadpools &) = delete;
+    common_threadpools & operator=(const common_threadpools &) = delete;
+
+    void init(llama_context * ctx, const common_params & params);
+
+private:
+    ggml_threadpool * threadpool       = nullptr;
+    ggml_threadpool * threadpool_batch = nullptr;
+
+    decltype(ggml_threadpool_free) * free_fn = nullptr;
+};
 
 // for testing purposes
 char * common_get_model_or_exit(int, char*[]);

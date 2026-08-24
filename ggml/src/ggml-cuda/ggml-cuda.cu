@@ -3522,10 +3522,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-<<<<<<< HEAD
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
-                // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
-=======
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             // Each mix qtype has its OWN registry; querying the 105 one for a 106
             // node always answers false, so dispatch on the type -- matching the
@@ -3542,7 +3538,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     && !mmid_rocmfp_mix_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
->>>>>>> 342e90367 (ggml: add qtype 105/106 per-expert mix support (Lucebox DSV4-Flash MIX-STRIX))
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
 #ifndef NDEBUG

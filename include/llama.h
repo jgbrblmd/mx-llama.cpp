@@ -170,6 +170,8 @@ extern "C" {
     // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
     LLAMA_API const char * llama_ftype_name(enum llama_ftype ftype);
 
+    LLAMA_API const char * llama_version(void);
+
     enum llama_rope_scaling_type {
         LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED = -1,
         LLAMA_ROPE_SCALING_TYPE_NONE        = 0,
@@ -210,6 +212,7 @@ extern "C" {
     };
 
     enum llama_load_mode {
+        LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
         LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
         LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
         LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
@@ -1282,9 +1285,12 @@ extern "C" {
         // [EXPERIMENTAL]
         // backend sampling interface:
 
-        // return true if the backend supports all ops needed by the sampler
+        // return true if the backend supports all ops needed by the sampler and can handle up to n_outputs_max_per_seq outputs per sequence
         // note: call once per sampler
-        bool (*backend_init)(struct llama_sampler * smpl, ggml_backend_buffer_type_t buft);
+        bool (*backend_init)(
+                struct llama_sampler       * smpl,
+                ggml_backend_buffer_type_t   buft,
+                uint32_t                     n_outputs_max_per_seq);
 
         // call after .backend_apply()
         void (*backend_accept)(
@@ -1302,6 +1308,13 @@ extern "C" {
 
         // called before graph execution to set inputs for the current ubatch
         void (*backend_set_input)(struct llama_sampler * smpl);
+
+        // called before rebuilding a sampling graph to clear any internal sampler state
+        void (*backend_reset)(struct llama_sampler * smpl);
+
+        // copy mutable state from src into dst while keeping dst's references to the current sampling graph
+        // src and dst must have the same type and configuration
+        void (*copy_state)(const struct llama_sampler * src, struct llama_sampler * dst);
     };
 
     struct llama_sampler {
@@ -1437,15 +1450,15 @@ extern "C" {
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
-                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty, -1 = context size)
-                               float   penalty_repeat,   // 1.0 = disabled
-                               float   penalty_freq,     // 0.0 = disabled
-                               float   penalty_present); // 0.0 = disabled
+                             int32_t   n_vocab,
+                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty)
+                               float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
+                               float   penalty_freq,     // must be finite, 0.0 = disabled
+                               float   penalty_present); // must be finite, 0.0 = disabled
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
-                             int32_t    n_ctx_train,
                                float    dry_multiplier,
                                float    dry_base,
                              int32_t    dry_allowed_length,

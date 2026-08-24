@@ -4317,32 +4317,6 @@ struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * voca
     );
 }
 
-void llama_sampler_copy(const struct llama_sampler * src, struct llama_sampler * dst) {
-    if (!src || !dst || src == dst) {
-        return;
-    }
-
-    GGML_ASSERT(src->iface == dst->iface && "llama_sampler_copy: cannot copy between different sampler types");
-
-    if (dst->iface->copy_state) {
-        dst->iface->copy_state(src, dst);
-        return;
-    }
-
-    // build a temporary sampler carrying src's current state
-    llama_sampler * tmp = llama_sampler_clone(src);
-
-    // free dst's old state (frees dst->ctx, including children for a chain)
-    if (dst->iface->free) {
-        dst->iface->free(dst);
-    }
-
-    // transplant tmp's state into dst, then destroy the (now empty) temp shell
-    dst->ctx = tmp->ctx;
-    tmp->ctx = nullptr;
-    delete tmp;
-}
-
 // utils
 
 uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
