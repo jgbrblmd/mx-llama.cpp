@@ -97,6 +97,17 @@ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }
 
+// DeepSeek4 clamped SwiGLU: gate clamped to (-inf, limit], up to [-limit, limit].
+// Used by the fused rocmfpX_mix gate/up decode kernels (exact same function the
+// standalone clamp + swiglu node sequence applies).
+__device__ __forceinline__ float ggml_cuda_op_swiglu_ds4_single(float gate, float up, float limit) {
+    gate = fminf(gate, limit);
+    up   = fmaxf(fminf(up, limit), -limit);
+
+    const float silu = gate / (1.0f + expf(-gate));
+    return silu * up;
+}
+
 __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {
     const float GELU_COEF_A    = 0.044715f;
     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
