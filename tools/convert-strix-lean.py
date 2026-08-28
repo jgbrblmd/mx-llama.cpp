@@ -107,6 +107,19 @@ def quantize_rocmfpx_fp8_flat(data_f32):
     fn(data_f32.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p), n)
     return out
 
+def quantize_mxfp4_flat(data_f32):
+    """Quantize a flat float32 array to MXFP4 (type 39, 17 bytes per 32 values)."""
+    lib = _lib()
+    fn = lib['quantize_mxfp4']
+    fn.restype = ctypes.c_size_t
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_void_p]
+    n = data_f32.size
+    assert n % 32 == 0, f'{n} not a multiple of 32'
+    out_size = n * 17 // 32
+    out = np.empty(out_size, dtype=np.uint8)
+    fn(data_f32.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p), 1, n, None)
+    return out
+
 def read_source_data(src_ti):
     """Read source tensor data as a flat float32 array, one value per logical element.
 
@@ -130,7 +143,7 @@ import argparse
 parser = argparse.ArgumentParser(description='Convert bf16 GGUF to ROCmFP4 or MXFP8 (STRIX_LEAN recipe)')
 parser.add_argument('bf16_gguf', help='source bf16 GGUF (Qwen3.8/3.5 hybrid)')
 parser.add_argument('out_gguf', help='output quantized GGUF')
-parser.add_argument('--output', '-o', choices=['rocmfp4', 'mxfp8'], default='rocmfp4',
+parser.add_argument('--output', '-o', choices=['rocmfp4', 'mxfp8', 'mxfp4'], default='rocmfp4',
                     help='quantization format (default: rocmfp4)')
 parser.add_argument('--threads', '-t', type=int, default=4, help='quantize threads (default: 4)')
 parser.add_argument('--arch', '-a', default='qwen35', help='output arch tag (default: qwen35)')
@@ -167,6 +180,14 @@ def quant_type_for(name, shape):
         return 'Q6_K'
     if OUTPUT_TYPE == 'mxfp8':
         return 'Q8_0_ROCMFPX'
+    if OUTPUT_TYPE == 'mxfp4':
+        # MXFP4 + Q8_0 hybrid: FFN weights -> MXFP4, Attention Q/K/V/gate -> Q8_0, rest -> F32
+        if (name.endswith('.attn_qkv.weight')
+                or name.endswith('.attn_k.weight')
+                or name.endswith('.attn_v.weight')
+                or name.endswith('.attn_gate.weight')):
+            return 'Q8_0'
+        return 'MXFP4'
     if (name.endswith('.attn_qkv.weight')
             or name.endswith('.attn_k.weight')
             or name.endswith('.attn_v.weight')):
@@ -200,6 +221,9 @@ w = GGUFWriter(OUT_GGUF, ARCH)
 if OUTPUT_TYPE == 'mxfp8':
     OUT_FILE_TYPE = 111  # MOSTLY_Q8_0_ROCMFPX
     OUT_QUANT_LABEL = 'Q8_0_ROCMFPX'
+elif OUTPUT_TYPE == 'mxfp4':
+    OUT_FILE_TYPE = 25   # MOSTLY_MXFP4
+    OUT_QUANT_LABEL = 'MXFP4'
 else:
     OUT_FILE_TYPE = 106  # MOSTLY_Q4_0_ROCMFP4
     OUT_QUANT_LABEL = 'Q4_0_ROCMFP4'
@@ -242,6 +266,10 @@ def quantize_job(job):
         quantized = quantize_rocmfpx_fp8_flat(data)
         tsz, blk = 33, 32
         raw_dtype = GGMLQuantizationType.Q8_0_ROCMFPX
+    elif qtype == 'MXFP4':
+        quantized = quantize_mxfp4_flat(data)
+        tsz, blk = 17, 32
+        raw_dtype = GGMLQuantizationType.MXFP4
     else:
         quantized = quantize_rocmfp4_fast_flat(data)
         tsz, blk = 17, 32
