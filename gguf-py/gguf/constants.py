@@ -5384,6 +5384,17 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    NVFP4_E8M0 = 43
+    # ROCmFPX extensions (keep in sync with ggml/include/ggml.h, 100-108)
+    Q4_0_ROCMFP4        = 100
+    Q4_0_ROCMFP4_FAST   = 101
+    Q6_0_ROCMFPX        = 102
+    Q8_0_ROCMFPX        = 103
+    Q3_0_ROCMFPX        = 104
+    Q3_1_ROCMFP3_MIX    = 105
+    Q2_1_ROCMFP2_MIX    = 106
+    Q2_0_ROCMFPX        = 107
+    Q2_0_ROCMFPX_AFFINE = 108
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5576,6 +5587,16 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    # ROCmFPX extensions (block, bytes-per-block)
+    GGMLQuantizationType.Q4_0_ROCMFP4:        (32, 18),
+    GGMLQuantizationType.Q4_0_ROCMFP4_FAST:   (32, 17),
+    GGMLQuantizationType.Q6_0_ROCMFPX:        (32, 26),
+    GGMLQuantizationType.Q8_0_ROCMFPX:        (32, 33),
+    GGMLQuantizationType.Q3_0_ROCMFPX:        (32, 14),
+    GGMLQuantizationType.Q3_1_ROCMFP3_MIX:    (32, 14),
+    GGMLQuantizationType.Q2_1_ROCMFP2_MIX:    (32, 10),
+    GGMLQuantizationType.Q2_0_ROCMFPX:        (32, 10),
+    GGMLQuantizationType.Q2_0_ROCMFPX_AFFINE: (32, 10),
 }
 
 

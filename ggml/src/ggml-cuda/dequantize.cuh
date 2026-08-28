@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "rocmfp4_hip_scale.cuh"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
@@ -449,4 +450,128 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
+
+    // S40 fp2: e[0]/e[1] = per-half UE4M3 scales; codes map through {-4, -1, +1, +4}
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i0 >= QK_ROCMFP2/2]);
+    const float d1 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i1 >= QK_ROCMFP2/2]);
+
+    static const int8_t values[4] = { -4, -1, 1, 4 };
+    v.x = d0 * (float) values[(x[ib].qs[i0/4] >> (2*(i0 % 4))) & 3u];
+    v.y = d1 * (float) values[(x[ib].qs[i1/4] >> (2*(i1 % 4))) & 3u];
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp2_affine(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
+
+    // Affine fp2: e[0] = scale, e[1] = offset for all 32; value = c*scale - offset
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float scale  = ggml_cuda_ue4m3_to_fp32(x[ib].e[0]);
+    const float offset = ggml_cuda_ue4m3_to_fp32(x[ib].e[1]);
+
+    v.x = scale * (float) ((x[ib].qs[i0/4] >> (2*(i0 % 4))) & 3u) - offset;
+    v.y = scale * (float) ((x[ib].qs[i1/4] >> (2*(i1 % 4))) & 3u) - offset;
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp6_device * x = (const block_rocmfp6_device *) vx;
+
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i0 >= QK_ROCMFP6/2]);
+    const float d1 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i1 >= QK_ROCMFP6/2]);
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+    v.x = d0 * (float) x[ib].qs[i0];
+    v.y = d1 * (float) x[ib].qs[i1];
+#else
+    // Unpack 6-bit codes from compact layout
+    const uint8_t * qs = x[ib].qs;
+    const int bit_pos = 6 * iqs;
+
+    uint32_t code0 = 0, code1 = 0;
+    for (int b = 0; b < 6; ++b) {
+        const int src_bit = bit_pos + b;
+        const uint8_t byte = qs[src_bit >> 3];
+        const int bit = src_bit & 7;
+        const uint32_t bit_val = (byte >> bit) & 1u;
+        if (b < 3) {
+            code0 |= bit_val << b;
+        } else {
+            code1 |= bit_val << (b - 3);
+        }
+    }
+    const int mag0 = code0 & 31u;
+    v.x = d0 * (float) ((code0 & 32u) ? -(mag0 == 0 ? 32 : mag0) : mag0);
+    const int mag1 = code1 & 31u;
+    v.y = d1 * (float) ((code1 & 32u) ? -(mag1 == 0 ? 32 : mag1) : mag1);
+#endif
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp3(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp3 * x = (const block_rocmfp3 *) vx;
+
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i0 >= QK_ROCMFP3/2]);
+    const float d1 = ggml_cuda_ue4m3_to_fp32(x[ib].e[i1 >= QK_ROCMFP3/2]);
+
+    // Unpack 3-bit codes from compact layout
+    const uint8_t * qs = x[ib].qs;
+
+    uint32_t code0 = 0, code1 = 0;
+    for (int b = 0; b < 3; ++b) {
+        const int src_bit = 3 * i0 + b;
+        const uint8_t byte = qs[src_bit >> 3];
+        const int bit = src_bit & 7;
+        const uint32_t bit_val = (byte >> bit) & 1u;
+        code0 |= bit_val << b;
+
+        const int src_bit1 = 3 * i1 + b;
+        const uint8_t byte1 = qs[src_bit1 >> 3];
+        const int bit1 = src_bit1 & 7;
+        const uint32_t bit_val1 = (byte1 >> bit1) & 1u;
+        code1 |= bit_val1 << b;
+    }
+
+    static const int mag[4] = { 0, 1, 2, 4 };
+    const int value0 = mag[code0 & 3u];
+    v.x = d0 * (float) ((code0 & 4u) ? -value0 : value0);
+    const int value1 = mag[code1 & 3u];
+    v.y = d1 * (float) ((code1 & 4u) ? -value1 : value1);
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp8 * x = (const block_rocmfp8 *) vx;
+
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].e);
+    v.x = d * (float) x[ib].qs[iqs + 0];
+    v.y = d * (float) x[ib].qs[iqs + 1];
+}
+
+static __device__ __forceinline__ void dequantize_rocmfp4(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp4 * x = (const block_rocmfp4 *) vx;
+
+    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
+    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
+
+    const uint8_t q = x[ib].qs[iqs];
+    v.x = d0 * (float) rocmfp4_decode_i8(q);
+    v.y = d1 * (float) rocmfp4_decode_i8(q >> 4);
+}
+
+static __device__ __forceinline__ void dequantize_rocmfp4_fast(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx;
+
+    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
+
+    const uint8_t q = x[ib].qs[iqs];
+    v.x = d * (float) rocmfp4_decode_i8(q);
+    v.y = d * (float) rocmfp4_decode_i8(q >> 4);
 }
