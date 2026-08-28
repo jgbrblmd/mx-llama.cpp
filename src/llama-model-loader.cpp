@@ -805,6 +805,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
+            case GGML_TYPE_MXFP4:   ftype = LLAMA_FTYPE_MOSTLY_MXFP4;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q4_0_ROCMFP4:      ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4;       break;
             case GGML_TYPE_Q4_0_ROCMFP4_FAST: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST;  break;
