@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama.h"
+#include "../rocmfpx/rocmfpx.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +47,17 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4:              name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4";              break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:         name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-LEAN";         break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT:     name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-COHERENT";     break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:         name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-FAST";         break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT:name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-FAST-COHERENT";break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:        name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-STRIX";        break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:   name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4-STRIX-LEAN";   break;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX:              name = LLAMA_FTYPE_PREFIX "Q6_0_ROCMFPX";              break;
+        case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX:              name = LLAMA_FTYPE_PREFIX "Q8_0_ROCMFPX";              break;
+        case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX:              name = LLAMA_FTYPE_PREFIX "Q3_0_ROCMFPX";              break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX:              name = LLAMA_FTYPE_PREFIX "Q2_0_ROCMFPX";              break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
@@ -583,8 +595,36 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
+        // Q2_0_ROCMFPX variant detection runs once per loader instance (the
+        // model is loaded twice: once virtual for sizing, once for real).
+        bool fp2_affine_detected = false;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            // Q2_0_ROCMFPX has two bitstream variants sharing the same block
+            // layout: the S40 codebook layout (type 107) and the affine
+            // scale+offset layout (type 108) used by other engines. Detect
+            // the variant once from the first fp2 tensor's data and remap
+            // the whole file consistently.
+            if (cur->type == GGML_TYPE_Q2_0_ROCMFPX && !fp2_affine_detected) {
+                fp2_affine_detected = true;
+                const int64_t tid = gguf_find_tensor(metadata, cur->name);
+                if (tid >= 0) {
+                    const size_t offs = gguf_get_data_offset(metadata) + gguf_get_tensor_offset(metadata, tid);
+                    const size_t nbytes = std::min((size_t) ggml_nbytes(cur), (size_t) (16384 * sizeof(block_rocmfp2)));
+                    std::vector<uint8_t> sample(nbytes);
+                    llama_file * f = files.back().get();
+                    f->seek(offs, SEEK_SET);
+                    f->read_raw(sample.data(), nbytes);
+                    if (rocmfpx_fp2_is_affine(sample.data(), nbytes)) {
+                        LLAMA_LOG_INFO("%s: detected affine Q2_0_ROCMFPX variant, remapping to q2_0_rocmfpx_affine\n", __func__);
+                        for (ggml_tensor * t2 = ggml_get_first_tensor(ctx); t2; t2 = ggml_get_next_tensor(ctx, t2)) {
+                            if (t2->type == GGML_TYPE_Q2_0_ROCMFPX) {
+                                t2->type = GGML_TYPE_Q2_0_ROCMFPX_AFFINE;
+                            }
+                        }
+                    }
+                }
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -770,7 +810,14 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
+            case GGML_TYPE_MXFP4:   ftype = LLAMA_FTYPE_MOSTLY_MXFP4;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_Q4_0_ROCMFP4:      ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4;       break;
+            case GGML_TYPE_Q4_0_ROCMFP4_FAST: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST;  break;
+            case GGML_TYPE_Q6_0_ROCMFPX:      ftype = LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX;       break;
+            case GGML_TYPE_Q8_0_ROCMFPX:      ftype = LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX;       break;
+            case GGML_TYPE_Q3_0_ROCMFPX:      ftype = LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX;       break;
+            case GGML_TYPE_Q2_0_ROCMFPX:      ftype = LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX;       break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             default:

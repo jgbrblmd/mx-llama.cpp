@@ -9,6 +9,8 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -627,6 +629,9 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 #endif
 
 }
+// Forward declarations for per-expert mix CPU stubs (defined later in this file)
+static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
@@ -942,7 +947,98 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_Q4_0_ROCMFP4] = {
+        .type_name                = "q4_0_rocmfp4",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_ref,
+    },
+    [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
+        .type_name                = "q4_0_rocmfp4_fast",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4_fast),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0_fast,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_fast_ref,
+    },
+    [GGML_TYPE_Q6_0_ROCMFPX] = {
+        .type_name                = "rocmfp6",
+        .blck_size                = QK_ROCMFPX,
+        .type_size                = sizeof(block_rocmfp6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp6,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp6_ref,
+    },
+    [GGML_TYPE_Q8_0_ROCMFPX] = {
+        .type_name                = "rocmfp8",
+        .blck_size                = QK_ROCMFPX,
+        .type_size                = sizeof(block_rocmfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp8,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp8_ref,
+    },
+    [GGML_TYPE_Q3_0_ROCMFPX] = {
+        .type_name                = "rocmfp3",
+        .blck_size                = QK_ROCMFPX,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
+    },
+    [GGML_TYPE_Q2_0_ROCMFPX] = {
+        .type_name                = "rocmfp2",
+        .blck_size                = QK_ROCMFPX,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
+    },
+    [GGML_TYPE_Q3_1_ROCMFP3_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP3. Same 14B block wire as
+        // q3_0; the per-expert codebook lives in GGUF KV and decode happens in
+        // the dedicated CUDA/HIP mul_mat_id path. The generic to_float/
+        // from_float_ref ABORT: a fixed-level fallback here would be silently
+        // wrong for adaptive experts.
+        .type_name                = "q3_1_rocmfp3_mix",
+        .blck_size                = QK_ROCMFP3,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
+    },
+    [GGML_TYPE_Q2_1_ROCMFP2_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP2. Same 10B block wire as
+        // q2_0; the per-expert codebook travels in the loader sidecar and decode
+        // happens in the dedicated CUDA/HIP mul_mat_id path.
+        .type_name                = "q2_1_rocmfp2_mix",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
+    },
 };
+
+// ---------------------------------------------------------------------------
+// Per-expert mixed ROCmFP3/FP2: CPU fallback is unsupported because the
+// per-expert codebook is out-of-band (loaded from GGUF sidecar into device
+// buffers). Dequantize/quantize must go through the CUDA/HIP path.
+// ---------------------------------------------------------------------------
+
+static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: generic CPU dequantization is unsupported -- the per-expert "
+               "codebook is out-of-band. Use the CUDA/HIP mix path (mul_mat_id or the "
+               "registry-aware to_fp16 shim).");
+}
+
+static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
+               "out-of-band metadata; generic CPU quantize is not supported.");
+}
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
     assert(type >= 0);
@@ -1437,8 +1533,16 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
-        case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
+        case GGML_FTYPE_MOSTLY_MXFP4:            wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4:              wtype = GGML_TYPE_Q4_0_ROCMFP4;              break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:         wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST;         break;
+        case GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX:              wtype = GGML_TYPE_Q6_0_ROCMFPX;              break;
+        case GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX:              wtype = GGML_TYPE_Q8_0_ROCMFPX;              break;
+        case GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX:              wtype = GGML_TYPE_Q3_0_ROCMFPX;              break;
+        case GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX:              wtype = GGML_TYPE_Q2_0_ROCMFPX;              break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:        wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST;         break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:   wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST;         break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
