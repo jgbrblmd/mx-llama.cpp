@@ -21,6 +21,8 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfpx/rocmfpx.h"
+#include "../../rocmfp4/rocmfp4.h"
 
 #include <array>
 #include <algorithm>
@@ -849,6 +851,29 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+// ROCmFP6 device layout. GGUF/CPU storage remains the packed block_rocmfp6 layout.
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
+
+// NVFP4 log2-fixed-point scale (ModelOpt GGUF): scale = 2^((e-169)/8)
+static __device__ __forceinline__ float ggml_cuda_nvfp4_e8m0_to_fp32(uint8_t x) {
+    return exp2f(((float) x - 169.0f) * 0.125f);
+}
+
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
@@ -862,18 +887,20 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
     return static_cast<float>(xf) / 2;
 #else
-    if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
+    if (x == 0 || x == 0x7F) { // Convert NaN to 0.0f
         return 0.0f;
     }
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;
-    float raw;
+    // Bit-exact with the ldexpf formulation in ggml-impl.h:
+    //   exp == 0:  man * 2^-10                  (exact float multiply)
+    //   otherwise: (1 + man/8) * 2^(exp - 8)    -> fp32 bits = ((exp + 119) << 23) | (man << 20)
+    // All e4m3 values are exactly representable in fp32, so no rounding occurs.
     if (exp == 0) {
-        raw = ldexpf((float) man, -9);
-    } else {
-        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+        return (float) man * 0.0009765625f;
     }
-    return static_cast<float>(raw / 2);
+    const uint32_t bits = (((uint32_t) exp + 119) << 23) | ((uint32_t) man << 20);
+    return __uint_as_float(bits);
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
@@ -1050,6 +1077,62 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_NVFP4_E8M0> {
+    static constexpr int qk = QK_NVFP4;
+    static constexpr int qr = QR_NVFP4;
+    static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFPX_AFFINE> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP6;
+    static constexpr int qr = QR_ROCMFP6;
+    static constexpr int qi = QI_ROCMFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP8;
+    static constexpr int qr = QR_ROCMFP8;
+    static constexpr int qi = QI_ROCMFP8;
 };
 
 template<>
