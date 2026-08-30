@@ -2142,6 +2142,10 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         }
         if (any_nonzero_slice) {
             meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
+            if (!meta_buf_ctx->bufs[i]) {
+                delete meta_buf_ctx;
+                return nullptr; // OOM — ggml_backend_alloc_ctx_tensors_from_buft already logged the error
+            }
         } else {
             meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {

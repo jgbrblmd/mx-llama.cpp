@@ -1560,12 +1560,16 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-#if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
-#else
+        // Linux default: CUDA uses NCCL; ROCm/RCCL defaults to internal because
+        // RCCL collective operations require the DKMS kernel module for stable
+        // peer-to-peer transport -- without it, ncclCommInitAll may succeed but
+        // actual allreduce calls segfault at inference time.  Users can override
+        // with GGML_CUDA_ALLREDUCE=nccl if they have a working RCCL setup.
+#if defined(GGML_USE_HIP)
         ggml_backend_cuda_comm_init_internal(ret);
-#endif // defined(__linux__)
+#else
+        ggml_backend_cuda_comm_init_nccl(ret);
+#endif // defined(GGML_USE_HIP)
     } else {
         std::string env_str(env);
         if (env_str == "nccl") {
@@ -1872,6 +1876,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
 
     return buffer;
+}
+
+static bool ggml_cuda_is_rocmfp4_f16_activation_mul_mat(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return (src0->type == GGML_TYPE_Q4_0_ROCMFP4 || src0->type == GGML_TYPE_Q4_0_ROCMFP4_FAST) &&
+           src1->type == GGML_TYPE_F16 &&
+           dst->type  == GGML_TYPE_F32;
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -2397,8 +2408,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
+    const bool src1_q8_compatible = src1->type == GGML_TYPE_F32 ||
+        ggml_cuda_is_rocmfp4_f16_activation_mul_mat(src0, src1, dst);
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1_q8_compatible &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2542,7 +2555,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const bool src1_q8_compatible = src1->type == GGML_TYPE_F32 ||
+        ggml_cuda_is_rocmfp4_f16_activation_mul_mat(src0, src1, dst);
+    if (bad_padding_clear || !src1_q8_compatible || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -6258,6 +6273,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q2_0_ROCMFPX:
+                    case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -6310,11 +6332,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
-                    case GGML_TYPE_MXFP4:
                         // 32-value sub-blocks. get_rows has a bounded path for a row that
                         // is whole native blocks but not whole QK_K super-blocks, so the
                         // requirement is the native block, not the super-block.
                         return op->src[0]->ne[0] % 32 == 0;
+                    case GGML_TYPE_MXFP4:
+                        return op->src[0]->ne[0] % 32 == 0;
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q2_0_ROCMFPX:
+                    case GGML_TYPE_Q2_0_ROCMFPX_AFFINE:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
+                        // 32-value sub-blocks, the row size does not guarantee
+                        // the QK_K super-blocks the get_rows kernel iterates on
+                        return op->src[0]->ne[0] % QK_K == 0;
                     default:
                         return false;
                 }
