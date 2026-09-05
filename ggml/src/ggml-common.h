@@ -226,6 +226,10 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// ModelOpt NVFP4: same layout but log2-fixed-point E8M0 scales
+typedef block_nvfp4 block_nvfp4_e8m0;
+#define QK_NVFP4_E8M0 QK_NVFP4
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -1127,6 +1131,11 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// Codebook10: E2M1-derived with max magnitude 10 (vs 12 for standard FP4)
+GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
