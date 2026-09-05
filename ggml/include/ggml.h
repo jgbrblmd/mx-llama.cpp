@@ -430,7 +430,17 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_NVFP4_E8M0 = 43, // NVFP4 (4 blocks, log2-fixed-point E8M0 scales, ModelOpt GGUF)
+        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
+        GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
+        GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
+        GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+        GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3; codebook in GGUF KV
+        GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2; codebook in sidecar
+        GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx 2-bit S40 codebook (per-half UE4M3 scales) layout
+        GGML_TYPE_Q2_0_ROCMFPX_AFFINE = 108, // ROCmFPx 2-bit affine (UE4M3 scale + offset) layout
+        GGML_TYPE_COUNT   = 109,
     };
 
     // precision
@@ -475,6 +485,14 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // ROCmFP4 UE4M3 dual-scale layout
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 101, // ROCmFP4 single-scale speed layout
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110, // ROCmFPx 6-bit reference layout
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111, // ROCmFPx 8-bit reference layout
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 114, // ROCmFPx 3-bit reference layout
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 112, // ROCmFPx 2-bit S40 codebook layout
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX      = 105, // ROCmFP4 Strix Halo quality/speed recipe
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
     };
 
     // available tensor operations:
