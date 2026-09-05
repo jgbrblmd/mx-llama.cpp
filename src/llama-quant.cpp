@@ -460,7 +460,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
 
-            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4) {
+                new_type = nx % qk_k == 0 ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
                 new_type = GGML_TYPE_Q8_0;
             }
             else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
@@ -475,6 +478,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q6_K;
             }
         }
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4) {
+        // all tensors -> MXFP4 (Q8_0 fallback if row size is not block-aligned)
+        new_type = tensor->ne[0] % ggml_blck_size(GGML_TYPE_MXFP4) == 0 ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
     } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
@@ -858,6 +864,14 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_MXFP4:     return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4: return GGML_TYPE_Q4_0_ROCMFP4;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST: return GGML_TYPE_Q4_0_ROCMFP4_FAST;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX: return GGML_TYPE_Q2_0_ROCMFPX;
+        case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX: return GGML_TYPE_Q3_0_ROCMFPX;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX: return GGML_TYPE_Q6_0_ROCMFPX;
+        case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX: return GGML_TYPE_Q8_0_ROCMFPX;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
