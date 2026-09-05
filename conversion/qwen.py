@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
@@ -98,6 +99,13 @@ class Qwen2MoeModel(TextModel):
         if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
             mapped = f"{name}.weight" if not name.endswith(".weight") else name
             # HF: [n_expert, n_embd, n_ff] -> GGML: {n_ff, n_embd, n_expert}
+            # Pre-merged and per-expert forms can coexist in some checkpoints; track
+            # produced merged names to avoid writing the same GGUF tensor twice.
+            gguf_down = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_DOWN_EXP, bid) if bid is not None else None
+            if gguf_down is not None and gguf_down in getattr(self, "_merged_experts_produced", set()):
+                return  # aggregation already produced this tensor
+            if gguf_down is not None:
+                self._merged_experts_produced.add(gguf_down)
             yield from super().modify_tensors(data_torch, mapped, bid)
             return
 
@@ -112,6 +120,15 @@ class Qwen2MoeModel(TextModel):
             base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
             mapped_gate = f"{base_name}.gate_proj.weight"
             mapped_up = f"{base_name}.up_proj.weight"
+            # Pre-merged and per-expert forms can coexist; skip if aggregation already
+            # produced these merged tensors, otherwise record so aggregation will skip.
+            if bid is not None:
+                gguf_gate = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_EXP, bid)
+                gguf_up = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP_EXP, bid)
+                if gguf_gate in self._merged_experts_produced or gguf_up in self._merged_experts_produced:
+                    return  # aggregation already produced these tensors
+                self._merged_experts_produced.add(gguf_gate)
+                self._merged_experts_produced.add(gguf_up)
             yield from super().modify_tensors(gate, mapped_gate, bid)
             yield from super().modify_tensors(up, mapped_up, bid)
             return
@@ -138,6 +155,17 @@ class Qwen2MoeModel(TextModel):
                     data_torch = torch.stack(datas, dim=0)
 
                     merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                    # Determine the corresponding GGUF tensor name to detect duplicates.
+                    if w_name == "down_proj":
+                        gguf_key = gguf.MODEL_TENSOR.FFN_DOWN_EXP
+                    elif w_name == "gate_proj":
+                        gguf_key = gguf.MODEL_TENSOR.FFN_GATE_EXP
+                    else:
+                        gguf_key = gguf.MODEL_TENSOR.FFN_UP_EXP
+                    gguf_merged = self.format_tensor_name(gguf_key, bid)
+                    if gguf_merged in getattr(self, "_merged_experts_produced", set()):
+                        continue  # pre-merged tensor already produced this GGUF name
+                    self._merged_experts_produced.add(gguf_merged)
 
                     yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
@@ -147,6 +175,7 @@ class Qwen2MoeModel(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
     def prepare_tensors(self):
+        self._merged_experts_produced = set()
         super().prepare_tensors()
 
         if self._experts is not None:
@@ -293,6 +322,39 @@ class _QwenMtpMixin:
     _original_block_count: int | None = None
     opt_num_mtp_layers: int = 0
 
+    @staticmethod
+    def _has_mtp_tensors(dir_model) -> bool:
+        """Check whether the checkpoint actually contains MTP tensors.
+        Some Qwen3.5 checkpoints ship mtp_num_hidden_layers=1 in config
+        but omit the mtp.* weights (e.g. finetunes without draft heads).
+        We must not inflate block_count in that case or the loader will
+        look for blk.N that does not exist."""
+        prefix = "model" if not getattr(ModelBase, "is_mistral_format", False) else "consolidated"
+        part_names = ModelBase.get_model_part_names(dir_model, prefix, ".safetensors")
+        if not part_names:
+            part_names = ModelBase.get_model_part_names(dir_model, "pytorch_model", ".bin")
+        index_name = "model.safetensors" + (".index.json" if any(n.endswith(".safetensors") for n in part_names) else "")
+        index_file = dir_model / index_name
+        if index_file.is_file():
+            with open(index_file, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            return any(k.startswith(("mtp.", "model.mtp.")) for k in weight_map)
+        for part_name in part_names:
+            full = dir_model / part_name
+            if not full.is_file():
+                continue
+            try:
+                ctx = gguf.utility.SafetensorsLocal(full)
+                with ctx as model_part:
+                    if model_part is None:
+                        continue
+                    for name in model_part.keys():
+                        if name.startswith(("mtp.", "model.mtp.")):
+                            return True
+            except Exception:
+                pass
+        return False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_count = self.hparams["num_hidden_layers"]
@@ -302,6 +364,9 @@ class _QwenMtpMixin:
             if n_mtp == 0:
                 assert self.opt_num_mtp_layers != 0
                 n_mtp = self.opt_num_mtp_layers
+            # Only inflate block_count when the checkpoint actually has MTP tensors.
+            if n_mtp > 0 and not self._has_mtp_tensors(self.dir_model):
+                n_mtp = 0
             self.block_count += n_mtp
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -372,6 +437,90 @@ class _QwenMtpMixin:
 class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
 
+    def __init__(self, dir_model: Any, *args: Any, **kwargs: Any) -> None:
+        super().__init__(dir_model, *args, **kwargs)
+        self._llm_norms_1centered = self._detect_norm_file_convention()
+
+    @staticmethod
+    def _is_vision_norm(name: str) -> bool:
+        # ViT blocks store raw LayerNorm scales (can be large/negative, e.g. min -1.27,
+        # mean 10+ in deep ViTs) — never 1-centered. Exclude them from the LLM norm
+        # convention check so they don't drag down the file-level min.
+        return name.startswith(("vision_tower.", "vision_model.")) or ".blocks." in name
+
+    def _detect_norm_file_convention(self) -> bool:
+        """Does this HF export store 1-centered RMSNorm gains (1+raw) instead of raw?
+
+        Unsloth / transformers>=5.14 exports store the effective gain directly
+        (all-LLM-norm min > -0.25, mean > 0.5, clustered around 1); the standard
+        transformers export stores raw (init~0, mixed signs, min well below -0.25).
+        On a file-level basis: 1-centered exports must skip the +1 offset below,
+        raw exports keep it. A manual override is available via the
+        _apply_norm_offset env var ("False" -> skip +1, "True" -> apply +1).
+        """
+        env = os.environ.get("_apply_norm_offset")
+        if env is not None:
+            return env.strip().lower() in ("false", "0", "no")
+
+        norm_names: set[str] = set()
+        index_file = self.dir_model / "model.safetensors.index.json"
+        if index_file.is_file():
+            with open(index_file, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            norm_names = {k for k in weight_map if k.endswith("norm.weight")}
+        else:
+            part_names = ModelBase.get_model_part_names(self.dir_model, "model", ".safetensors")
+            if not part_names:
+                part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
+            for part_name in part_names:
+                full = self.dir_model / part_name
+                if not full.is_file():
+                    continue
+                try:
+                    with gguf.utility.SafetensorsLocal(full) as part:
+                        if part is None:
+                            continue
+                        norm_names |= {n for n in part.keys() if n.endswith("norm.weight")}
+                except Exception:
+                    continue
+
+        candidates = [
+            n for n in norm_names
+            if "linear_attn" not in n and not self._is_vision_norm(n)
+        ]
+        if not candidates:
+            return False
+
+        try:
+            from safetensors import safe_open
+
+            values: list[Tensor] = []
+            weight_map: dict[str, str] = {}
+            if index_file.is_file():
+                with open(index_file, "r", encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            for name in candidates:
+                part = weight_map.get(name)
+                if part is None:
+                    continue
+                try:
+                    with safe_open(str(self.dir_model / part), framework="pt") as st:
+                        t = st.get_tensor(name)
+                    values.append(t.to(torch.float32).reshape(-1))
+                except Exception:
+                    continue
+            if not values:
+                return False
+            allv = torch.cat(values)
+            fmin = float(allv.min().item())
+            fmean = float(allv.mean().item())
+            logger.info(f"LLM norm convention scan ({len(candidates)} tensors): "
+                        f"min={fmin:.4f} mean={fmean:.4f} -> "
+                        f"{'1-centered (skip +1)' if fmin > -0.25 and fmean > 0.5 else 'raw (apply +1)'}")
+            return fmin > -0.25 and fmean > 0.5
+        except Exception:
+            return False
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
@@ -392,7 +541,11 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         elif "conv1d" in name:
             data_torch = data_torch.squeeze()
         elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
-            data_torch = data_torch + 1
+            # HF exports vary in norm convention: standard transformers stores raw gains
+            # (+1 needed), while unsloth / transformers>=5.14 exports already store the
+            # 1-centered effective gain. Vision-tower norms are always raw.
+            if not (self._llm_norms_1centered and not self._is_vision_norm(name)):
+                data_torch = data_torch + 1
 
         if "in_proj_qkvz.weight" in name:
             # original order:  [q, k, v, z] * head_count

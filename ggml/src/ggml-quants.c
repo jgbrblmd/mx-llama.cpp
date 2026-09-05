@@ -2,6 +2,8 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "../rocmfpx/rocmfpx.h"
+#include "../rocmfp4/rocmfp4.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -609,6 +611,47 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+
+// NVFP4 with log2-fixed-point scales (ModelOpt GGUF)
+void quantize_row_nvfp4_e8m0_ref(const float * GGML_RESTRICT x, block_nvfp4_e8m0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4_E8M0;
+    static const int qk_sub = QK_NVFP4_SUB;
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub;
+            float amax = 0.0f;
+            for (int j = 0; j < qk_sub; j++) { if (amax < fabsf(xb[j])) amax = fabsf(xb[j]); }
+            y[i].d[s] = ggml_fp32_to_nvfp4_e8m0(amax / 6.0f);
+            const float d = ggml_nvfp4_e8m0_to_fp32(y[i].d[s]);
+            for (int j = 0; j < qk_sub/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
+void dequantize_row_nvfp4_e8m0(const block_nvfp4_e8m0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4_E8M0;
+    static const int qk_sub = QK_NVFP4_SUB;
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float d = ggml_nvfp4_e8m0_to_fp32(x[i].d[s]);
+            const int8_t * wb = (const int8_t *) &x[i].qs[s*(qk_sub/2)];
+            for (int j = 0; j < qk_sub/2; ++j) {
+                y[i*qk + s*qk_sub + j              ] = wb[j]              * d;
+                y[i*qk + s*qk_sub + j + qk_sub/2   ] = wb[j + qk_sub/2] * d;
+            }
+        }
+    }
+}
 }
 
 //
