@@ -537,6 +537,10 @@ class ModelBase:
                             tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
+                    # Remove KV cache scale tensors (FP8 KV cache quantization)
+                    for name in self.model_tensors.keys():
+                        if name.endswith((".k_scale", ".v_scale")):
+                            tensors_to_remove.append(name)
                 elif nvfp4_compressed_tensors:
                     # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
                     pass
