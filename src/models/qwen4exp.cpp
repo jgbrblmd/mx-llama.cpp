@@ -238,8 +238,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             // arrives at the widened 4-branch residual and is folded by hc_* below
             layer.nextn.enorm     = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,     "weight", il), { n_embd }, mtp_flags);
             layer.nextn.hnorm     = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,     "weight", il), { hc_dim }, mtp_flags);
-            layer.nextn.eh_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,   "weight", il), { n_embd, n_embd }, mtp_flags);
-            layer.nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN, "weight", il), { n_embd, n_embd }, mtp_flags);
+            // Generic NextN converters emit one matrix over concat(e, h) instead of two square matrices, so accept either width.
+            const std::string eh_name = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il).str();
+            const auto * eh_meta = ml.get_tensor_meta(eh_name.c_str());
+            const bool eh_fused = eh_meta != nullptr && eh_meta->ne[0] == 2*n_embd;
+
+            layer.nextn.eh_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,   "weight", il), { eh_fused ? 2*n_embd : n_embd, n_embd }, mtp_flags);
+            layer.nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN, "weight", il), { n_embd, n_embd }, eh_fused ? TENSOR_NOT_REQUIRED : mtp_flags);
             layer.nextn.hc_norm   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_NORM,   "weight", il), { hc_dim }, mtp_flags);
             layer.nextn.hc_down   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_DOWN,   "weight", il), { hc_dim, hc_lr }, mtp_flags);
             layer.nextn.hc_up     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_UP,     "weight", il), { hc_lr, hc_dim }, mtp_flags);
@@ -400,6 +405,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const int  il_beg = is_mtp ? (int) n_layer + cparams.nextn_layer_offset : 0;
     const int  il_end = is_mtp ? il_beg + 1 : (int) n_layer;
 
+    // A head-only file has no trunk, so the loop below would dereference tensors it never carried.
+    if (!is_mtp && n_layer > 0 && model.layers[0].hc_attn_norm == nullptr) {
+        throw std::runtime_error("this GGUF contains only the NextN/MTP head, load it as a draft model instead");
+    }
+
     ggml_tensor * inpL = nullptr;
     std::unique_ptr<llm_graph_input_embd_h> inp_mtp;
 
@@ -458,7 +468,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         GGML_ASSERT(mtp.nextn.enorm     && "MTP block missing nextn.enorm");
         GGML_ASSERT(mtp.nextn.hnorm     && "MTP block missing nextn.hnorm");
         GGML_ASSERT(mtp.nextn.eh_proj   && "MTP block missing nextn.eh_proj");
-        GGML_ASSERT(mtp.nextn.fc_hidden && "MTP block missing nextn.fc_hidden");
+        // fc_hidden is absent when eh_proj carries both projections fused.
+        GGML_ASSERT((mtp.nextn.fc_hidden || mtp.nextn.eh_proj->ne[0] == 2*n_embd) && "MTP block missing nextn.fc_hidden");
 
         ggml_tensor * tok = ggml_get_rows(ctx0, model.tok_embd, inp_mtp->tokens);
         cb(tok, "mtp_tok_embd", il_beg);
@@ -498,10 +509,18 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // Unlike the DeepSeek-shaped nextn, which runs ONE projection over
         // concat(e, h), qwen4exp carries two square [n_embd, n_embd] matrices and sums
         // their outputs.
-        ggml_tensor * e_proj = build_lora_mm(mtp.nextn.eh_proj,   e_norm);
-        ggml_tensor * h_proj = build_lora_mm(mtp.nextn.fc_hidden, h_norm);
+        // A fused eh_proj is applied to the concatenation rather than split, since a quantized weight has no cheap view along its input axis.
+        if (mtp.nextn.fc_hidden) {
+            ggml_tensor * e_proj = build_lora_mm(mtp.nextn.eh_proj,   e_norm);
+            ggml_tensor * h_proj = build_lora_mm(mtp.nextn.fc_hidden, h_norm);
 
-        res_hc = ggml_add(ctx0, e_proj, h_proj);
+            res_hc = ggml_add(ctx0, e_proj, h_proj);
+        } else {
+            ggml_tensor * eh = ggml_concat(ctx0, e_norm, h_norm, 0);
+            cb(eh, "mtp_eh_concat", il_beg);
+
+            res_hc = build_lora_mm(mtp.nextn.eh_proj, eh);
+        }
         cb(res_hc, "mtp_fused", il_beg);
     } else {
         // the wide residual starts as hc identical copies of the embedding
