@@ -187,6 +187,19 @@ that section for the numbers - where previously the multi-GPU verify under `-sm 
 cost more than the drafting saved. Acceptance still tracks the text, so measure on your
 own prompts.
 
+Speculating used to cost most of the prefill throughput on this architecture, because two
+graph shapes moved from chunk to chunk and the scheduler could not keep a plan across them.
+Changing the NextN mode altered the graph output requirements without invalidating the
+reservation, so the following graph ran on a plan sized for the previous mode, and the
+rollback convolution snapshot graph emitted one window per snapshot the batch happened to
+carry, so its node count tracked history length. The snapshot graph now emits one window
+per ring plane and crops back to the snapshots actually present, which holds the node count
+constant while producing the same rows. On 4x MI50 with the MTP UD-Q4_K_XL quant, a
+15.8k-token prompt under `-sm layer` goes 421 to 1047 t/s of prefill, against 1184 t/s for
+the same prompt without speculation - so drafting now costs about a tenth of prefill rather
+than two thirds. Generation and draft acceptance are unchanged and the output is
+byte-identical. On by default, with no flag.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the

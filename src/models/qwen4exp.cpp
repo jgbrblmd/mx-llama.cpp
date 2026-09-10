@@ -1281,6 +1281,26 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
+static ggml_tensor * qwen4exp_conv_windows(
+        ggml_context * ctx0, ggml_tensor * conv_input,
+        int64_t state_cols, int64_t channels, int64_t n_seqs, int64_t n_snap, int64_t n_planes) {
+    const int64_t n_new_cols = conv_input->ne[0] - state_cols;
+    GGML_ASSERT(n_snap > 0 && n_snap <= n_new_cols && n_snap <= n_planes);
+    const int64_t first_col = n_new_cols - n_snap + 1;
+    ggml_tensor * windows = nullptr;
+    for (int64_t snap = 0; snap < n_planes; ++snap) {
+        ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, first_col + std::min(snap, n_snap - 1)));
+        window = ggml_reshape_3d(ctx0, ggml_cont(ctx0, window), state_cols * channels, 1, n_seqs);
+        windows = windows == nullptr ? window : ggml_concat(ctx0, windows, window, 1);
+    }
+    windows = ggml_view_3d(ctx0, windows, state_cols * channels, n_snap, n_seqs,
+            windows->nb[1], windows->nb[2], 0);
+    return ggml_cont(ctx0, windows);
+}
+
 // Read a conv history out of its own recurrent row and write the new tail back.
 // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
@@ -1318,18 +1338,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     if (keep_snapshots && inp->s_write_conv != nullptr) {
         GGML_ASSERT(inp->n_snap > 0 && inp->n_snap <= n_new_cols);
 
-        // One strided window per snapshot, each made contiguous on its own.
-        // An im2col over the widened tail needs a flat view that cuts inside a head-split segment under -sm tensor, and the meta backend has no split rule for im2col anyway.
-        const int64_t first_col = n_new_cols - inp->n_snap + 1;
-        ggml_tensor * windows = nullptr;
-        for (int64_t snap = 0; snap < inp->n_snap; ++snap) {
-            ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
-                    state_cols, channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, first_col + snap));
-            window  = ggml_reshape_3d(ctx0, ggml_cont(ctx0, window), row_total, 1, n_seqs);
-            windows = windows == nullptr ? window : ggml_concat(ctx0, windows, window, 1);
-        }
+        // One window per ring plane, cropped back to the snapshots this batch really has.
+        // The node count is therefore constant across chunks, which keeps the scheduler plan.
+        ggml_tensor * windows = qwen4exp_conv_windows(ctx0, conv_input, state_cols, channels,
+                n_seqs, inp->n_snap, mctx_cur->get_n_planes());
         GGML_ASSERT(windows->ne[0] == row_total);
         GGML_ASSERT(windows->ne[1] == inp->n_snap);
         GGML_ASSERT(windows->ne[2] == n_seqs);

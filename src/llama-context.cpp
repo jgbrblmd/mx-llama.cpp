@@ -1295,6 +1295,15 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        // Changing the nextn mode changes the graph output requirements, and the reservation
+        // computed for the previous mode is then too small.
+        // Without this the next graph runs on an inadequate memory plan and pays repeated
+        // allocation and rebind work on every MTP prefill chunk.
+        // The flag is set only when a mode actually changes, so a steady run reserves once.
+        sched_need_reserve = true;
+    }
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
