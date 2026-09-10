@@ -1217,7 +1217,7 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 }
 
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_repacked_w32(
+static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
