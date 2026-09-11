@@ -168,6 +168,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX            = 111, // ROCmFPx experimental 8-bit reference layout
         LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX            = 114, // ROCmFPx experimental 3-bit reference layout
         LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX            = 112, // ROCmFPx experimental 2-bit S40 codebook layout
+        LLAMA_FTYPE_MOSTLY_CT_INT4                 = 113, // compressed-tensors INT4 (group_size=128, symmetric, packed int32)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

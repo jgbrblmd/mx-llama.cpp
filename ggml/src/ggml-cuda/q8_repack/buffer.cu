@@ -148,6 +148,48 @@ static __global__ void repack_q8_0_kernel(
     }
 }
 
+// Device-side CT_INT4 repack: canonical block_ct_int4 (68 B: f16 d + 2 pad + 16
+// int32, LSB-first nibbles) to the de-aliased nibble plane (16 B/32, byte i =
+// code i | code (16+i) << 4, raw codes 0..15) plus the 2-byte f16 scale plane at
+// group granularity (one entry per 128-weight group, sub-blocks blk..blk+3 share
+// slot blk/4; only the first of the four writes it). The raw codes ride the affine
+// epilogue (dequant (c-8)*d) on the kernel side.
+static __global__ void repack_ct_int4_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    const int64_t n_ct = n_blocks / 4;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+
+        const block_ct_int4 * c = (const block_ct_int4 *) (src + e * src_stride) + row * n_ct + blk / 4;
+        const int j  = blk % 4;
+        // Value k of sub-block j is CT-block weight p = j*32 + k -> word p>>3 =
+        // j*4 + k>>3, nibble (p&7)*4 = (k&7)*4.
+#pragma unroll
+        for (int i0 = 0; i0 < 16; i0++) {
+            const uint32_t w0 = c->qs[j * 4 + (i0 >> 3)];
+            const uint32_t w1 = c->qs[j * 4 + (i0 >> 3) + 2];
+            const uint32_t lo = (w0 >> ((i0 & 7) * 4)) & 0x0F;
+            const uint32_t hi = (w1 >> ((i0 & 7) * 4)) & 0x0F;
+            d_qs[i0] = (uint8_t) (lo | (hi << 4));
+        }
+        // Group scale: the 4 sub-blocks of the group share one slot.
+        if (j == 0) {
+            const uint16_t d_bits = *reinterpret_cast<const uint16_t *> (&c->d);
+            uint8_t * d_d = dst + e * dst_stride + qs_len + (row * n_ct + blk / 4) * 2;
+            d_d[0] = (uint8_t) d_bits;
+            d_d[1] = (uint8_t) (d_bits >> 8);
+        }
+    }
+}
+
 // Device-side MXFP4 repack: canonical block_mxfp4 (17 B: e8m0 byte, 16 nibble
 // bytes) to de-aliased nibble rows + a 1-byte e plane. The de-alias gap bytes
 // are never read (the kernels guard with sb < n_sub), matching the Q8_0 kernel.
@@ -416,6 +458,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         switch (tensor->type) {
             case GGML_TYPE_Q8_0:
                 repack_q8_0_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
+            case GGML_TYPE_CT_INT4:
+                repack_ct_int4_kernel<<<grid, block, 0, stream>>>(
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;

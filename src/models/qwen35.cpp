@@ -557,12 +557,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    // Phase 2b: KV-only prefill replay. The deferred replay builds the head's prompt K/V so the
-    // head can attend over the prompt when drafting; its attention/FFN/logits output is discarded
-    // (process_decode reads the TRUNK hidden, batch logits=0). So when LLAMA_MTP_PREFILL_KV_ONLY is
-    // armed, build + store ONLY K/V (identical to the full path) and skip Q/attention/gate/wo/FFN/
-    // output - removing the O(n^2) attention and the FFN that dominate the replay cost.
-    if (cparams.mtp_prefill_kv_only) {
+    // KV-only build: the deferred prefill replay AND the per-step catch-up decode (process_decode)
+    // both only need this head's K/V stored - their attention/FFN/logits output is discarded
+    // (process_decode reads the TRUNK hidden, and both build the batch with logits=0, so
+    // n_outputs == 0). Build + store ONLY K/V (identical to the full path) and skip
+    // Q/attention/gate/wo/FFN/output. The catch-up runs on every speculative step for 1+n_draft
+    // tokens, so skipping the lm_head here removes a big per-step waste (the head's BF16 lm_head
+    // is ~2.5 GB of weights re-read for logits that nothing samples).
+    if (cparams.mtp_prefill_kv_only || n_outputs == 0) {
         ggml_tensor * Kc = build_lora_mm(layer.wk, cur, layer.wk_s);
         Kc = ggml_reshape_3d(ctx0, Kc, n_embd_head, n_head_kv, n_tokens);
         Kc = build_norm(Kc, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);

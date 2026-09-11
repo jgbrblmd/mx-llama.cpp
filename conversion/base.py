@@ -77,6 +77,14 @@ class ModelType(IntEnum):
     MMPROJ = 2
 
 
+CT_INT4_TYPE_CHOICES = ("keep", "Q8_0", "Q6_K", "Q5_K", "Q4_K")
+
+
+def resolve_ct_int4_type(name: str) -> gguf.GGMLQuantizationType | None:
+    """Type for the tensors a compressed-tensors INT4 recipe leaves unquantized, or None to keep them."""
+    return None if name == "keep" else gguf.GGMLQuantizationType[name]
+
+
 class ModelBase:
     _model_classes: dict[ModelType, dict[str, type[ModelBase]]] = {
         ModelType.TEXT: {},
@@ -130,7 +138,9 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 ct_int4_head_type: str = "Q8_0",
+                 ct_int4_mtp_type: str = "Q8_0"):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -160,8 +170,14 @@ class ModelBase:
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
         self._is_nvfp4 = False
         self._is_mxfp4 = False
+        self._is_ct_int4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        # A compressed-tensors INT4 recipe leaves the output projection and the MTP head
+        # unquantized, but both are read in full on every decode step, so the checkpoint
+        # dtype costs real bandwidth. "keep" preserves it for A/B comparisons.
+        self._ct_int4_head_type = resolve_ct_int4_type(ct_int4_head_type)
+        self._ct_int4_mtp_type = resolve_ct_int4_type(ct_int4_mtp_type)
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -520,23 +536,38 @@ class ModelBase:
                     assert weight_config.get("type", "int") == "int"
                     num_bits = weight_config.get("num_bits")
                     group_size = weight_config.get("group_size")
+                    symmetric = weight_config.get("symmetric", True)
                     assert isinstance(num_bits, int)
                     assert isinstance(group_size, int)
-                    for name in self.model_tensors.keys():
+                    ct_int4_packed_names = []
+                    for name in list(self.model_tensors.keys()):
                         if name.endswith(".weight_packed"):
                             base_name = name.removesuffix("_packed")
                             w = self.model_tensors[name]
                             scale = self.model_tensors[base_name + "_scale"]
                             shape = self.model_tensors[base_name + "_shape"]
                             zero_point = self.model_tensors.get(base_name + "_zero_point", lambda: None)
-                            new_tensors[base_name] = (
-                                lambda w=w, scale=scale, shape=shape, zero_point=zero_point: dequant_packed(
-                                    w(), scale(), shape(), zero_point(), num_bits, group_size,
+                            # Detect ct_int4-compatible format: symmetric INT4, group_size=128, num_bits=4, no zero_point
+                            is_ct_int4 = (num_bits == 4 and group_size == 128 and symmetric is True and zero_point() is None)
+                            if is_ct_int4:
+                                # Keep packed weights + scales for direct ct_int4 GGUF writing
+                                # Store as separate tensors with ct_int4 marker in name
+                                ct_int4_packed_names.append(base_name)
+                            else:
+                                new_tensors[base_name] = (
+                                    lambda w=w, scale=scale, shape=shape, zero_point=zero_point: dequant_packed(
+                                        w(), scale(), shape(), zero_point(), num_bits, group_size,
+                                    )
                                 )
-                            )
-                            tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
-                            if (base_name + "_zero_point") in self.model_tensors:
-                                tensors_to_remove.append(base_name + "_zero_point")
+                                tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
+                                if (base_name + "_zero_point") in self.model_tensors:
+                                    tensors_to_remove.append(base_name + "_zero_point")
+                    # Add ct_int4 tensors after iteration completes
+                    for base_name in ct_int4_packed_names:
+                        self.model_tensors[base_name + ".weight_packed"] = self.model_tensors[base_name + "_packed"]
+                        self.model_tensors[base_name + ".weight_scale"] = self.model_tensors[base_name + "_scale"]
+                        self.model_tensors[base_name + ".weight_shape"] = self.model_tensors[base_name + "_shape"]
+                        tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                     # Remove KV cache scale tensors (FP8 KV cache quantization)
                     for name in self.model_tensors.keys():
                         if name.endswith((".k_scale", ".v_scale")):
@@ -652,11 +683,32 @@ class ModelBase:
         return [(new_name, data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        del new_name, bid  # unused
         # Force FP8-original tensors to Q8_0 when requested; Q8_0 is faster than F16/BF16.
         if self._fp8_as_q8 and name in self._fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0
+        # The output projection and the nextn (MTP) blocks are what a compressed-tensors
+        # INT4 recipe keeps unquantized; both are read in full on every decode step, and
+        # the output projection once more per drafted token.
+        if self._is_ct_int4 and n_dims >= 2:
+            if self._ct_int4_head_type is not None and self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.OUTPUT, bid):
+                return self._ct_int4_head_type
+            # nextn blocks are appended after the decoder layers, so their block id sits at
+            # or past the layer count of the config
+            if self._ct_int4_mtp_type is not None and bid is not None and bid >= self.n_decoder_layers():
+                return self._ct_int4_mtp_type
         return False
+
+    def n_decoder_layers(self) -> int:
+        """Number of decoder layers of the base model, excluding any nextn/MTP block.
+
+        When the config does not say, no block id can reach the result, so no tensor
+        is taken for a nextn one.
+        """
+        for src in (self.hparams, self.hparams.get("text_config") or {}):
+            for key in ("num_hidden_layers", "n_layers", "n_layer", "num_layers"):
+                if isinstance(n := src.get(key), int):
+                    return n
+        return 1 << 30
 
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
@@ -698,6 +750,51 @@ class ModelBase:
 
         raw = torch.cat((s.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
         return raw.reshape(rows, n_blocks * 17).cpu().numpy()
+
+    @staticmethod
+    def _ct_int4_pack(weight_packed: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
+        """Repack compressed-tensors INT4 (pack-quantized, group_size=128, symmetric) into ggml ct_int4 layout.
+
+        Packed weights: int32 tensor of shape (out_features, in_features // 8),
+            where each int32 holds 8 x 4-bit values (little-endian nibbles).
+        Scales: fp16 tensor of shape (out_features, in_features // 128), one symmetric scale per 128-weight block.
+
+        ct_int4 block layout: 1 x fp16 scale (2 bytes) + 2 bytes padding + 16 x int32 (64 bytes) = 68 bytes per 128-weight block.
+        Returns (raw_uint8_data, logical_shape)."""
+
+        out_features = weight_packed.shape[0]
+        in_features = weight_packed.shape[1] * 8
+        group_size = 128
+        n_groups = in_features // group_size
+
+        # scale tensor has 1 scale per 128-weight block
+        scale_n_groups = scale.shape[1]
+        assert scale_n_groups == n_groups, f"scale shape {tuple(scale.shape)} != {(out_features, n_groups)}"
+
+        # Each 128-weight block has 128/8 = 16 int32 values
+        int32_per_block = group_size // 8
+        # Reshape packed weights to (out_features, n_groups, int32_per_block)
+        w = weight_packed.reshape(out_features, n_groups, int32_per_block)
+        # Reshape scales to (out_features, n_groups, 1) as fp16 (1 scale per block)
+        s = scale.to(torch.float16).reshape(out_features, n_groups, 1)
+
+        # Concatenate along last axis: (out_features, n_groups, 1 + int32_per_block)
+        # where 1 = [fp16], int32_per_block = [int32, ..., int32]
+        # Convert to uint8 for the raw byte layout
+        w_u8 = w.cpu().numpy().astype('<i4', copy=False).view(np.uint8).reshape(out_features, n_groups, int32_per_block * 4)
+        s_u8 = s.cpu().numpy().astype('<f2', copy=False).view(np.uint8).reshape(out_features, n_groups, 2)
+        # Add 2 bytes of padding per block to match C struct alignment (ggml_half -> uint32_t)
+        pad = np.zeros((out_features, n_groups, 2), dtype=np.uint8)
+        raw = np.concatenate([s_u8, pad, w_u8], axis=-1).reshape(out_features, n_groups * (2 + 2 + int32_per_block * 4))
+
+        return raw, [out_features, n_groups * group_size]
+
+    def _repack_ct_int4(self, name: str, weight_packed: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
+        """Repack compressed-tensors INT4 into ggml ct_int4 layout.
+
+        Subclasses may override this to apply tensor-specific transformations
+        (e.g. V-head reordering for linear_attn.out_proj) before packing."""
+        return self._ct_int4_pack(weight_packed, scale)
 
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
@@ -872,6 +969,25 @@ class ModelBase:
 
         self._is_nvfp4 = quant_algo in ("NVFP4", "W4A16_NVFP4")
         self._is_mxfp4 = quant_method == "mxfp4"
+        # Detect ct_int4: compressed-tensors pack-quantized INT4, group_size=128, num_bits=4, symmetric, no zero_point
+        self._is_ct_int4 = (
+            quant_method == "compressed-tensors"
+            and quant_format == "pack-quantized"
+            and bool(quant_groups)
+            and all(
+                g.get("format") == "pack-quantized"
+                and g.get("weights", {}).get("num_bits") == 4
+                and g.get("weights", {}).get("group_size") == 128
+                and g.get("weights", {}).get("symmetric") is True
+                for g in quant_groups.values()
+                if isinstance(g, dict)
+            )
+        )
+
+        if self._is_ct_int4:
+            logger.info("ct_int4: output tensor -> %s, MTP head -> %s ('keep' keeps the checkpoint dtype)",
+                        "keep" if self._ct_int4_head_type is None else self._ct_int4_head_type.name,
+                        "keep" if self._ct_int4_mtp_type is None else self._ct_int4_mtp_type.name)
 
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
@@ -902,6 +1018,25 @@ class ModelBase:
             self._generate_nvfp4_tensors()
 
         self.dequant_model()
+
+        # Handle ct_int4 tensors (compressed-tensors INT4 pack-quantized) before main tensor loop
+        ct_int4_names = [name for name in self.model_tensors.keys() if name.endswith(".weight_packed")]
+        for name in ct_int4_names:
+            base_name = name.removesuffix(".weight_packed")
+            w_packed = self.model_tensors[name]
+            w_scale = self.model_tensors[base_name + ".weight_scale"]
+            w_shape = self.model_tensors[base_name + ".weight_shape"]
+            # Pack into ct_int4 uint8 layout
+            # Subclasses may apply tensor-specific transformations (e.g. V-head reordering) in _repack_ct_int4
+            raw, shape = self._repack_ct_int4(base_name, w_packed(), w_scale())
+            new_name = self.map_tensor_name(base_name)
+            logger.info(f"ct_int4: {new_name}, shape = {shape}, raw_dtype=CT_INT4")
+            self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.CT_INT4)
+            # Remove ct_int4 auxiliary tensors
+            for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+                key = base_name + suffix
+                if key in self.model_tensors:
+                    del self.model_tensors[key]
 
         # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
         if self.tensor_map.mapping:
@@ -1053,6 +1188,8 @@ class ModelBase:
                 self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4
             elif self._is_mxfp4:
                 self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+            elif self._is_ct_int4:
+                self.ftype = gguf.LlamaFileType.MOSTLY_CT_INT4
 
         # Generate parameter weight class (useful for leader boards) if not yet determined
         if self.metadata.size_label is None and total_params > 0:

@@ -21,6 +21,11 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         case GGML_TYPE_IQ4_NL: {
             return t->ne[0] % 32 == 0;
         }
+        case GGML_TYPE_CT_INT4: {
+            // whole 128-weight blocks: the repack maps each block to 4 Q8_0 sub-blocks,
+            // a partial trailing block would repack to garbage
+            return t->ne[0] % 128 == 0;
+        }
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K: {
@@ -60,13 +65,13 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
 }
 
-// The FUSED mat-vec path dispatches to mul_mat_vec_q8_0_repacked, which is Q8_0-only:
-// an MXFP4 sub-block is a single uint4 of nibbles, so that kernel's half-block
-// indexing (2 uint4 per sub-block) has no MXFP4 equivalent. MXFP4 reaches the GEMM
-// for every token count instead, so it must not be offered the fusion.
+// The FUSED mat-vec path routes each type to its own kernel: Q8_0 keeps the tuned
+// bespoke mul_mat_vec_q8_0_repacked, every other repack type takes the generic
+// mul_mat_vec_rp (which reads through rp_traits, so the nibble-plane types and the
+// affine CT_INT4 are covered). Offered to the dense FFN up/gate/GLU sites.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
-    return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
+    return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4 || t->type == GGML_TYPE_CT_INT4) &&
            ggml_cuda_repack_mul_mat_should_fire(src0);
 }
 
@@ -83,6 +88,44 @@ bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor * src0) {
     // Each of these four types has been gated on a real MoE model: deterministic, unfused path unchanged, width-1 PPL within the repack's own spread.
     const bool kq   = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_IQ4_NL;
     return (base || (kquant && kq)) && ggml_cuda_repack_mul_mat_should_fire(src0);
+}
+
+// Host repack of one CT_INT4 matrix: dequantize each 128-weight block (1 x f16
+// scale + 16 x int32, LSB-first nibbles) into 4 Q8_0 sub-blocks and store them
+// in the Q8_0 two-plane layout.
+// Host repack of one CT_INT4 matrix: de-aliased nibble rows [ne1 x rs, byte i =
+// code i | code (16+i) << 4, raw codes 0..15] then a 2-byte f16 scale plane [ne1 x
+// ne0/128] (one entry per 128-weight group, not replicated over the 4 sub-blocks).
+// The raw codes ride the affine epilogue (dequant (c-8)*d) on the kernel side.
+void repack_ct_int4_host(const block_ct_int4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_blocks = ne0 / 32;
+    const int64_t n_ct     = ne0 / 128;
+    const int64_t rs       = repack_qs_stride(ne0 / 2);   // nibble row stride (bytes)
+    const size_t  qs_len   = (size_t) ne1 * rs;
+
+    memset(dst, 0, qs_len + (size_t) ne1 * n_ct * 2);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_ct; blk++) {
+            const block_ct_int4 & c = blocks[row * n_ct + blk];
+            const uint16_t d_bits = *reinterpret_cast<const uint16_t *> (&c.d);
+            // 4 sub-blocks of 32; sub s holds the 128-block positions s*32 + k.
+            for (int s = 0; s < 4; s++) {
+                for (int i = 0; i < 16; i++) {
+                    const int p0 = s * 32 + i;
+                    const int p1 = p0 + 16;
+                    const uint32_t w0 = c.qs[p0 / 8];
+                    const uint32_t w1 = c.qs[p1 / 8];
+                    const uint32_t lo = (w0 >> ((p0 % 8) * 4)) & 0x0F;
+                    const uint32_t hi = (w1 >> ((p1 % 8) * 4)) & 0x0F;
+                    dst[(size_t) row * rs + (size_t) (blk * 4 + s) * 16 + i] = (uint8_t) (lo | (hi << 4));
+                }
+            }
+            dst[qs_len + (size_t) (row * n_ct + blk) * 2]     = (uint8_t) d_bits;
+            dst[qs_len + (size_t) (row * n_ct + blk) * 2 + 1] = (uint8_t) (d_bits >> 8);
+        }
+    }
 }
 
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
@@ -307,6 +350,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
     switch (type) {
         case GGML_TYPE_Q8_0:
             repack_q8_0_host((const block_q8_0 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_CT_INT4:
+            repack_ct_int4_host((const block_ct_int4 *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_MXFP4:
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);

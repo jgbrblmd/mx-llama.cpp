@@ -85,6 +85,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_1>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
+                    case GGML_TYPE_CT_INT4:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_CT_INT4>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     case GGML_TYPE_Q5_K:
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_K>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
@@ -221,12 +225,16 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
     const bool    work_ok   = n_blocks >= RP_NC_MIN_ACCUM * RP_NC_LANES_WIDE;
     const bool    lanes16_ok = work_ok && (ne01 + 31) / 32 >= min_grid;
     const bool    lanes32_ok = work_ok && (ne01 +  7) /  8 >= min_grid;
+
     switch (ne11) {
         case 2: {
             if (lanes16_ok) {
-                // 16 lanes to a row, 32 rows per block, one row per lane.
+                // 32 lanes to a row, 32 rows per block, 2 rows per lane: the
+                // RPL=2 reuse halves the activation re-reads that a one-row
+                // lane pays at this width. Measured on gfx906 (Qwen3.8-27B)
+                // this beats the old <32,8,2,1,16> shape by ~10ms per pass.
                 const dim3 grid((ne01 + 31) / 32, 1, 1);
-                mul_mat_vec_repacked_nc<32, 8, 2, 1, 16, WT><<<grid, 512, 0, stream>>>(
+                mul_mat_vec_repacked_nc<32, 8, 2, 2, 32, WT><<<grid, 512, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
@@ -236,9 +244,10 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         } break;
         case 3: {
             if (lanes32_ok) {
-                // 32 lanes to a row, 8 rows per block, one row per lane.
-                const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT><<<grid, 256, 0, stream>>>(
+                // 32 lanes to a row, 32 rows per block, 2 rows per lane (same
+                // RPL=2 win as width 2 above).
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 8, 3, 2, 32, WT><<<grid, 512, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
@@ -316,6 +325,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
+            case GGML_TYPE_CT_INT4: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_CT_INT4, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
@@ -367,6 +382,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
+            case GGML_TYPE_CT_INT4:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_CT_INT4><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
             case GGML_TYPE_Q5_K:
                 mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q5_K><<<grid, dim3(64, nrl), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
@@ -406,6 +426,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_Q5_1:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q5_1><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_CT_INT4:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_CT_INT4><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
@@ -513,6 +538,11 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
         } else if (src0->type == GGML_TYPE_Q4_K) {
             mul_mat_vec_rp<GGML_TYPE_Q4_K, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 1, 0, 0, 0,
+                w_gate, x_bias_s, gate_bias_s, glu_op);
+        } else if (src0->type == GGML_TYPE_CT_INT4) {
+            mul_mat_vec_rp<GGML_TYPE_CT_INT4, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);

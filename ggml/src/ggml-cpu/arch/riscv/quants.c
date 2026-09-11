@@ -942,6 +942,46 @@ void ggml_vec_dot_q2_K_q8_K_vl256(int n, float * GGML_RESTRICT s, size_t bs, con
 #endif
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+
+void ggml_vec_dot_ct_int4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_CT_INT4;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ct_int4 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0;
+
+    for (; ib < nb; ++ib) {
+        const float d_ct = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_base = y + ib * 4;
+
+        for (int j = 0; j < 4; ++j) {
+            int sumi = 0;
+            const block_q8_0 * GGML_RESTRICT y_j = y_base + j;
+            const float d_q = GGML_CPU_FP16_TO_FP32(y_j->d);
+            const int8_t * GGML_RESTRICT y_qs = y_j->qs;
+            for (int st = 0; st < 32; ++st) {
+                int elem_idx = j * 32 + st;
+                int qs_idx   = elem_idx >> 3;
+                int bit_off  = (elem_idx & 7) << 2;
+                const int q_uns = (x[ib].qs[qs_idx] >> bit_off) & 0x0F;
+                const int q     = q_uns - 8;
+                sumi += q * y_qs[st];
+            }
+            sumf += sumi * d_ct * d_q;
+        }
+    }
+    *s = sumf;
+}
 #if defined __riscv_xtheadvector
     ggml_vec_dot_q2_K_q8_K_xtheadvector(n, s, bs, vx, bx, vy, by, nrc);
 #elif defined __riscv_v

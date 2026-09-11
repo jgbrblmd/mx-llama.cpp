@@ -230,6 +230,20 @@ static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + Q
 typedef block_nvfp4 block_nvfp4_e8m0;
 #define QK_NVFP4_E8M0 QK_NVFP4
 
+//
+// compressed-tensors INT4 (pack-quantized, group_size=128, symmetric)
+// Packed weights: int32 tensor where each int32 holds 8 x 4-bit values (little-endian nibbles)
+// Scales: fp16 tensor with one scale per 128-weight block (symmetric, no min)
+//
+
+#define QK_CT_INT4 128
+typedef struct {
+    ggml_half  d;       // fp16 scale for 128-weight block (symmetric, no min)
+    uint32_t   qs[16];  // 16 x int32 = 128 x int4 values (8 int4 per int32, LSB-first nibble)
+} block_ct_int4;
+// 2 + 2(padding) + 64 = 68 bytes, 4-byte alignment (uint32_t)
+static_assert(sizeof(block_ct_int4) == 68, "wrong ct_int4 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

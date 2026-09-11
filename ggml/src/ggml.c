@@ -1019,6 +1019,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
         .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
     },
+    [GGML_TYPE_CT_INT4] = {
+        .type_name                = "ct_int4",
+        .blck_size                = QK_CT_INT4,
+        .type_size                = sizeof(block_ct_int4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ct_int4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ct_int4_ref,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1549,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX:              wtype = GGML_TYPE_Q8_0_ROCMFPX;              break;
         case GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX:              wtype = GGML_TYPE_Q3_0_ROCMFPX;              break;
         case GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX:              wtype = GGML_TYPE_Q2_0_ROCMFPX;              break;
+        case GGML_FTYPE_MOSTLY_CT_INT4:                   wtype = GGML_TYPE_CT_INT4;                   break;
         case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:        wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST;         break;
         case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:   wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST;         break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
@@ -8119,6 +8128,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_CT_INT4: result = quantize_ct_int4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

@@ -611,6 +611,7 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+}
 
 // NVFP4 with log2-fixed-point scales (ModelOpt GGUF)
 void quantize_row_nvfp4_e8m0_ref(const float * GGML_RESTRICT x, block_nvfp4_e8m0 * GGML_RESTRICT y, int64_t k) {
@@ -652,7 +653,6 @@ void dequantize_row_nvfp4_e8m0(const block_nvfp4_e8m0 * GGML_RESTRICT x, float *
         }
     }
 }
-}
 
 //
 // 2-6 bit quantization in super-blocks
@@ -666,6 +666,92 @@ static inline int nearest_int(float fval) {
     float val = fval + 12582912.f;
     int i; memcpy(&i, &val, sizeof(int));
     return (i & 0x007fffff) - 0x00400000;
+}
+
+//
+// compressed-tensors INT4 (pack-quantized, group_size=128, symmetric)
+//
+
+// Best index for symmetric 4-bit: values in [-8, 7], scale = amax / 7.0f
+static inline int best_index_ct_int4(float x, float scale) {
+    int q = nearest_int(x / scale);
+    if (q < -8) q = -8;
+    if (q >  7) q =  7;
+    return q + 8; // convert to unsigned [0, 15]
+}
+
+void quantize_row_ct_int4_ref(const float * GGML_RESTRICT x, block_ct_int4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_CT_INT4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        // Compute absmax over the full 128-weight block
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+        const float d = amax > 0.0f ? amax / 7.0f : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        // Pack 8 int4 values per int32 (little-endian nibbles), store as 16 int32 values
+        for (int j = 0; j < 16; ++j) {
+            uint32_t packed = 0;
+            for (int s = 0; s < 8; s++) {
+                const int idx = i*qk + j*8 + s;
+                const int q = best_index_ct_int4(x[idx], d);
+                packed |= (uint32_t)q << (s * 4);
+            }
+            y[i].qs[j] = packed;
+        }
+    }
+}
+
+// =============================================================================
+// CT_INT4 GPU (CUDA/HIP) port reference — verified-correct CPU semantics
+// (model Qwen3.8-27B-INT4 end-to-end validated 2026-09-10, CPU path).
+//
+// Layout per 128-weight block (68 bytes, see block_ct_int4 in ggml-common.h):
+//   [0:2]   fp16 scale d   (symmetric, ONE scale per 128 weights)
+//   [2:4]   padding (aligns uint32_t qs)
+//   [4:68]  16 x int32 qs, each holding 8 x int4 values, LSB-first nibble
+// Dequant:  val[i] = (((qs[i>>3] >> ((i&7)*4)) & 0x0F) - 8) * d
+//           (== compressed-tensors dequant: (code - 8) * scale, code 0..15)
+// vec_dot:  1 CT_INT4 block x 4 Q8_0 activation blocks, per-sub-block scale.
+//           Reference kernels: ggml_vec_dot_ct_int4_q8_0 (arch SIMD) and
+//           ggml_vec_dot_ct_int4_q8_0_generic (ggml-cpu/quants.c) — the generic
+//           MUST pair int32 j with Q8_0 block (j/4) + offset (j%4)*8.
+//
+// TODO(gpu): port to ggml/src/ggml-cuda — dequantize_row_ct_int4 + mul_mat
+//   support (dequant-to-fp16 path and/or MMQ-style quantized dot); register in
+//   the ct_int4 type dispatch used by ggml_cuda_mul_mat. See plan-ct-int4-gguf.md.
+// =============================================================================
+void dequantize_row_ct_int4(const block_ct_int4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_CT_INT4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // Unpack 8 int4 values per int32 (little-endian nibbles)
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t packed = x[i].qs[j];
+            for (int s = 0; s < 8; s++) {
+                const int idx = i*qk + j*8 + s;
+                const int q_uns = (packed >> (s * 4)) & 0x0F;
+                const int q = q_uns - 8; // convert to signed [-8, 7]
+                y[idx] = q * d;
+            }
+        }
+    }
 }
 
 static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT L, int rmse_type,
@@ -2352,6 +2438,12 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_ct_int4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_ct_int4_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_CT_INT4, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)

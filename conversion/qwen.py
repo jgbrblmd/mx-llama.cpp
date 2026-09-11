@@ -758,10 +758,69 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                # Out projection weight: reorder columns (input dimension)
-                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+                # Out projection weight maps to ssm_out.weight in GGUF.
+                # No V-head reordering needed — the output dimension (5120) is already in the correct order.
+                pass
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def _repack_ct_int4(self, name: str, weight_packed: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
+        """Repack compressed-tensors INT4 with V-head reordering for linear_attn tensors."""
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+
+        if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
+            head_k_dim = self.hparams["linear_key_head_dim"]
+            head_v_dim = self.hparams["linear_value_head_dim"]
+            num_v_per_k = num_v_heads // num_k_heads
+
+            if ".in_proj_qkv." in name:
+                # QKV weight: reorder only the V rows
+                q_dim = head_k_dim * num_k_heads
+                k_dim = head_k_dim * num_k_heads
+                q = weight_packed[:q_dim]
+                k = weight_packed[q_dim:q_dim + k_dim]
+                v = weight_packed[q_dim + k_dim:]
+                q_scale = scale[:q_dim]
+                k_scale = scale[q_dim:q_dim + k_dim]
+                v_scale = scale[q_dim + k_dim:]
+                v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                v_scale = self._reorder_v_heads(v_scale, 0, num_k_heads, num_v_per_k, head_v_dim)
+                weight_packed = torch.cat([q, k, v], dim=0)
+                scale = torch.cat([q_scale, k_scale, v_scale], dim=0)
+
+            elif ".in_proj_z." in name:
+                weight_packed = self._reorder_v_heads(weight_packed, 0, num_k_heads, num_v_per_k, head_v_dim)
+                scale = self._reorder_v_heads(scale, 0, num_k_heads, num_v_per_k, head_v_dim)
+
+            elif ".in_proj_a." in name or ".in_proj_b." in name:
+                weight_packed = self._reorder_v_heads(weight_packed, 0, num_k_heads, num_v_per_k, 1)
+                scale = self._reorder_v_heads(scale, 0, num_k_heads, num_v_per_k, 1)
+
+            elif ".out_proj." in name:
+                # The graph produces the SSM output with V heads in tiled order
+                # (see the in_proj reorders above), so the out_proj columns
+                # (in_features = num_v_heads * head_v_dim) must be tiled the same
+                # way to line up.  head_v_dim == 128 == one CT_INT4 quant group,
+                # so whole 16-int32 groups (+ their scale) move together.
+                assert head_v_dim % 128 == 0
+                # NOTE: index_select on LazyTorchTensor yields wrong values, so
+                # force the tensors eager first (they are fully read anyway in pack).
+                weight_packed = LazyTorchTensor.to_eager(weight_packed)
+                scale = LazyTorchTensor.to_eager(scale)
+                col_perm = self._reorder_v_heads(
+                    torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                    1, num_k_heads, num_v_per_k, head_v_dim,
+                ).squeeze(0)
+                group_perm = col_perm.view(-1, head_v_dim)[:, 0] // head_v_dim
+                n_groups = weight_packed.shape[1] // 16
+                assert group_perm.numel() == n_groups, f"{group_perm.numel()} != {n_groups}"
+                weight_packed = weight_packed.view(weight_packed.shape[0], n_groups, 16)
+                weight_packed = weight_packed.index_select(1, group_perm.to(device=weight_packed.device))
+                weight_packed = weight_packed.reshape(weight_packed.shape[0], -1).contiguous()
+                scale = scale.index_select(1, group_perm.to(device=scale.device))
+
+        return self._ct_int4_pack(weight_packed, scale)
 
 
 class _Qwen35MRopeMixin:

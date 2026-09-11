@@ -24,6 +24,7 @@ from conversion import (
     print_registered_models,
     _mistral_common_installed,
     _mistral_import_error_msg,
+    CT_INT4_TYPE_CHOICES,
 )
 
 
@@ -155,6 +156,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
+    )
+
+    parser.add_argument(
+        "--ct-int4-head-type", choices=CT_INT4_TYPE_CHOICES, default="Q8_0",
+        help="Type for the output projection (lm_head) of a compressed-tensors INT4 model. "
+             "The recipe leaves it unquantized, but it is read in full on every decode step; Q8_0 "
+             "costs ~5e-4 max logit error and saves ~1.1 GiB of traffic per token. 'keep' preserves the checkpoint dtype.",
+    )
+    parser.add_argument(
+        "--ct-int4-mtp-type", choices=CT_INT4_TYPE_CHOICES, default="Q8_0",
+        help="Same, for the MTP head (mtp.* -> blk.<n>.*) weights. The MTP head only proposes draft "
+             "tokens that the target verifies, so its precision cannot change the output distribution.",
     )
 
     parser.add_argument(
@@ -290,6 +303,8 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     ct_int4_head_type=args.ct_int4_head_type,
+                                     ct_int4_mtp_type=args.ct_int4_mtp_type,
                                      )
 
         if args.vocab_only:

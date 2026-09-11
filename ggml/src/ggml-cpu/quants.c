@@ -478,6 +478,50 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// GPU (CUDA/HIP) port reference: CT_INT4 weight x Q8_0 activation dot semantics.
+// 128 weight elements = 16 int32 (8 int4 each); activation = 4 Q8_0 blocks.
+// int32 j pairs with Q8_0 block (j/4), element offset (j%4)*8 within the block.
+// (The x86 SIMD twin in arch/x86/quants.c iterates the same pairing as 4x32 sub-blocks.)
+void ggml_vec_dot_ct_int4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_CT_INT4;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ct_int4 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0;
+
+    for (; ib < nb; ++ib) {
+        const float d_ct = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_base = y + ib * 4;
+
+        for (int j = 0; j < 16; ++j) {
+            int sumi = 0;
+            const uint32_t packed = x[ib].qs[j];
+            // int32 j covers activation elements [j*8 .. j*8+7]; each Q8_0 block
+            // holds 32 elements, so there are 4 blocks per 128-element CT_INT4 block.
+            const block_q8_0 * GGML_RESTRICT y_j = y_base + (j / 4);
+            const float d_q = GGML_CPU_FP16_TO_FP32(y_j->d);
+            const int8_t * GGML_RESTRICT y_qs = y_j->qs + (j % 4) * 8;
+            for (int st = 0; st < 8; ++st) {
+                const int q_uns = (packed >> (st * 4)) & 0x0F;
+                const int q     = q_uns - 8; // signed [-8, 7]
+                sumi += q * y_qs[st];
+            }
+            sumf += sumi * d_ct * d_q;
+        }
+    }
+    *s = sumf;
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

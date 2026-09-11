@@ -120,6 +120,22 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// compressed-tensors INT4 (128-weight block): 1 x fp16 scale + 16 x int32 (LSB-first nibbles)
+// get_rows qr=2 convention: iqs in [0, qk/2), v.x = val[iqs], v.y = val[iqs + qk/2].
+static __device__ __forceinline__ void dequantize_ct_int4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_ct_int4 * x = (const block_ct_int4 *) vx;
+
+    const float d = __half2float(*reinterpret_cast<const __half *>(&x[ib].d));
+
+    const int off = (iqs & 7) << 2;
+
+    v.x = ((x[ib].qs[iqs >> 3]         >> off) & 0xF) - 8.0f;
+    v.y = ((x[ib].qs[(iqs >> 3) + 8]   >> off) & 0xF) - 8.0f;
+
+    v.x *= d;
+    v.y *= d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

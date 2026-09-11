@@ -5539,6 +5539,7 @@ class GGMLQuantizationType(IntEnum):
     Q2_1_ROCMFP2_MIX    = 106
     Q2_0_ROCMFPX        = 107
     Q2_0_ROCMFPX_AFFINE = 108
+    CT_INT4             = 109  # compressed-tensors INT4 (group_size=128, symmetric, packed int32)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5595,6 +5596,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_CT_INT4       = 113  # except 1d tensors (compressed-tensors INT4)
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5741,6 +5743,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q2_1_ROCMFP2_MIX:    (32, 10),
     GGMLQuantizationType.Q2_0_ROCMFPX:        (32, 10),
     GGMLQuantizationType.Q2_0_ROCMFPX_AFFINE: (32, 10),
+    GGMLQuantizationType.CT_INT4:             (128, 68),   # compressed-tensors INT4: 1xfp16 scale + 16xint32 (8 int4 per int32)
 }
 
 

@@ -4,6 +4,7 @@ from .base import (
     ModelBase, TextModel, MmprojModel, ModelType, SentencePieceTokenTypes,
     logger, _mistral_common_installed, _mistral_import_error_msg,
     get_model_architecture, LazyTorchTensor,
+    CT_INT4_TYPE_CHOICES, resolve_ct_int4_type,
 )
 from typing import Type
 
@@ -13,6 +14,7 @@ __all__ = [
     "get_model_architecture", "LazyTorchTensor", "logger",
     "_mistral_common_installed", "_mistral_import_error_msg",
     "get_model_class", "print_registered_models", "load_all_models",
+    "CT_INT4_TYPE_CHOICES", "resolve_ct_int4_type",
 ]
 
 

@@ -440,7 +440,8 @@ extern "C" {
         GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2; codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx 2-bit S40 codebook (per-half UE4M3 scales) layout
         GGML_TYPE_Q2_0_ROCMFPX_AFFINE = 108, // ROCmFPx 2-bit affine (UE4M3 scale + offset) layout
-        GGML_TYPE_COUNT   = 109,
+        GGML_TYPE_CT_INT4           = 109, // compressed-tensors INT4 (group_size=128, symmetric, packed int32)
+        GGML_TYPE_COUNT             = 110,
     };
 
     // precision
@@ -493,6 +494,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 112, // ROCmFPx 2-bit S40 codebook layout
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX      = 105, // ROCmFP4 Strix Halo quality/speed recipe
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
+        GGML_FTYPE_MOSTLY_CT_INT4                 = 113, // compressed-tensors INT4 (group_size=128, symmetric)
     };
 
     // available tensor operations:

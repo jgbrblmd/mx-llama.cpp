@@ -83,6 +83,25 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 }
 
+// One thread per 128-weight block: 16 int32 loads, 128 outputs.
+template<typename dst_t>
+static __global__ void dequantize_block_ct_int4(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
+    const int64_t i = blockIdx.x;
+    if (i >= nb) {
+        return;
+    }
+    const int tid = threadIdx.x;
+
+    const block_ct_int4 * x = (const block_ct_int4 *) vx + i;
+    const float d = __half2float(*reinterpret_cast<const __half *>(&x->d));
+
+    dst_t * y = yy + i*QK_CT_INT4 + tid;
+    const int off = (tid & 7) << 2;
+
+    y[ 0] = ggml_cuda_cast<dst_t>(d * (((float) ((x->qs[tid >> 3] >> off) & 0xF)) - 8.0f));
+    y[64] = ggml_cuda_cast<dst_t>(d * (((float) ((x->qs[(tid >> 3) + 8] >> off) & 0xF)) - 8.0f));
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -296,6 +315,12 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
     const int nb32 = k / 32;
     const int nb = (k + 255) / 256;
     dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+
+template<typename dst_t>
+static void dequantize_row_ct_int4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_CT_INT4;
+    dequantize_block_ct_int4<<<nb, 128, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
@@ -595,6 +620,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
             return dequantize_row_rocmfp4_fast_cuda;
+        case GGML_TYPE_CT_INT4:
+            return dequantize_row_ct_int4_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -665,6 +692,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_rocmfp3_mix_to_fp16_cuda;
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
             return dequantize_rocmfp2_mix_to_fp16_cuda;
+        case GGML_TYPE_CT_INT4:
+            return dequantize_row_ct_int4_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -732,6 +761,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_rocmfp3_mix_to_fp32_cuda;
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
             return dequantize_rocmfp2_mix_to_fp32_cuda;
+        case GGML_TYPE_CT_INT4:
+            return dequantize_row_ct_int4_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

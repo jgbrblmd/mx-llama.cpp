@@ -71,6 +71,10 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        // CT_INT4 is affine ((c-8)*d), so its src1 (activation) quantization must
+        // carry the per-32 activation sum, like Q4_K - the DS4 layout.
+        case GGML_TYPE_CT_INT4:
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0_ROCMFP4:

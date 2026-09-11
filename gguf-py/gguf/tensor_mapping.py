@@ -890,8 +890,8 @@ class TensorNameMap:
             "model.layers.{bid}.out_proj",               # mamba-hf
             "backbone.layers.{bid}.mixer.out_proj",      # mamba
             "model.layers.{bid}.mamba.out_proj",         # jamba falcon-h1 granite-hybrid
-            "model.layers.{bid}.linear_attn.out_proj",   # qwen3next
             "model.layers.layers.{bid}.mixer.out_proj",  # plamo2
+            "model.layers.{bid}.linear_attn.out_proj",   # qwen3.5
         ),
 
         MODEL_TENSOR.SSM_ALPHA: (
