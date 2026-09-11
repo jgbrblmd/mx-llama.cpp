@@ -163,6 +163,13 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // TurboQuant: shared 128x128 Walsh-Hadamard-style rotation matrices, lazily created the
+    // first time a turbo2/turbo3/turbo4 K type is encountered while building the cache layers.
+    // turbo_rotation     = R   (forward rotation, for Q pre-rotate-queries)
+    // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
+    ggml_tensor * get_turbo_rotation()     const { return turbo_rotation; }
+    ggml_tensor * get_turbo_rotation_inv() const { return turbo_rotation_inv; }
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -282,6 +289,10 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // TurboQuant: shared rotation matrix tensors (see get_turbo_rotation() above)
+    ggml_tensor * turbo_rotation     = nullptr; // R   (forward rotation)
+    ggml_tensor * turbo_rotation_inv = nullptr; // R^T = R^{-1} (inverse rotation)
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -393,6 +404,11 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    // TurboQuant: forward the shared rotation matrices from the underlying llama_kv_cache
+    // (see llama_kv_cache::get_turbo_rotation() for details).
+    ggml_tensor * get_turbo_rotation()     const;
+    ggml_tensor * get_turbo_rotation_inv() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

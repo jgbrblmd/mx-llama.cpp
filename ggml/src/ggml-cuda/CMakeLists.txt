@@ -124,6 +124,21 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
+    # TurboQuant FA template instances (always compiled, regardless of GGML_CUDA_FA_ALL_QUANTS).
+    # NOTE: turbo-quant.cu itself is already picked up by the blanket "*.cu" glob above;
+    # no -O1 override is needed here — the FWHT miscompile this works around (see
+    # ggml-hip/CMakeLists.txt) is specific to the HIP/gfx906 compiler, not nvcc.
+    if (NOT GGML_CUDA_FA_ALL_QUANTS)
+        file(GLOB SRCS "template-instances/fattn-vec*turbo2*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB SRCS "template-instances/fattn-vec*turbo3*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB SRCS "template-instances/fattn-vec*turbo4*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB SRCS "template-instances/fattn-vec*f16-q8_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

@@ -5,6 +5,204 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <unordered_map>
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Persistent fp16 shadow cache for turbo3 KV
+//
+//  NOTE (ported from moriyasujapan's gfx906-turbo-gemma4 fork): this shadow-cache
+//  path dequantizes an entire turbo K/V cache into a contiguous fp16 buffer so
+//  the ordinary fp16 FA kernels can be used. It is OFF by default because the V
+//  dequant here has a layout/stride bug (see turbo_shadow_sync below) relative to
+//  the native turbo vec-kernel path (get_vec_dot_KQ/get_dequantize_V in
+//  fattn-common.cuh). Set GGML_TURBO_SHADOW_CACHE=1 to opt into this path for
+//  testing/benchmarking; by default ggml_cuda_flash_attn_ext() below routes
+//  turbo K/V straight to the native vec kernel instead.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static __global__ void k_turbo3_dequant_rows_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0,
+        const int64_t row_start, const int64_t n_rows,
+        const size_t  src_nb1,   const size_t  src_nb2,
+        const int64_t dst_row_stride, const int64_t dst_head_stride) {
+
+    const float C[8] = {
+        -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+         0.021460f,  0.065717f,  0.117832f,  0.190685f
+    };
+
+    const int64_t local_row = blockIdx.x;
+    const int64_t head      = blockIdx.y;
+    const int j = threadIdx.x;
+    if (j >= ne0 || local_row >= n_rows) return;
+
+    const int64_t abs_row = row_start + local_row;
+
+    const char * src_row = src + head * src_nb2 + abs_row * src_nb1;
+    const int blk_idx  = j / QK_TURBO3;
+    const int j_in_blk = j % QK_TURBO3;
+    const block_turbo3_0 * blk = (const block_turbo3_0 *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+    const uint8_t low2 = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+    const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
+    const float val = C[low2 | (hi1 << 2)] * norm;
+
+    dst[head * dst_head_stride + abs_row * dst_row_stride + j] = __float2half(val);
+}
+
+static __global__ void k_turbo2_dequant_rows_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0,
+        const int64_t row_start, const int64_t n_rows,
+        const size_t  src_nb1,   const size_t  src_nb2,
+        const int64_t dst_row_stride, const int64_t dst_head_stride) {
+
+    const float C[4] = {
+        -0.133462f, -0.039994f, 0.039994f, 0.133462f
+    };
+
+    const int64_t local_row = blockIdx.x;
+    const int64_t head      = blockIdx.y;
+    const int j = threadIdx.x;
+    if (j >= ne0 || local_row >= n_rows) return;
+
+    const int64_t abs_row = row_start + local_row;
+
+    const char * src_row = src + head * src_nb2 + abs_row * src_nb1;
+    const int blk_idx  = j / QK_TURBO2;
+    const int j_in_blk = j % QK_TURBO2;
+    const block_turbo2_0 * blk = (const block_turbo2_0 *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+    const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+    const float val = C[idx] * norm;
+
+    dst[head * dst_head_stride + abs_row * dst_row_stride + j] = __float2half(val);
+}
+
+static __global__ void k_turbo4_dequant_rows_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0,
+        const int64_t row_start, const int64_t n_rows,
+        const size_t  src_nb1,   const size_t  src_nb2,
+        const int64_t dst_row_stride, const int64_t dst_head_stride) {
+
+    const float C[8] = {
+        -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+         0.021460f,  0.065717f,  0.117832f,  0.190685f
+    };
+
+    const int64_t local_row = blockIdx.x;
+    const int64_t head      = blockIdx.y;
+    const int j = threadIdx.x;
+    if (j >= ne0 || local_row >= n_rows) return;
+
+    const int64_t abs_row = row_start + local_row;
+    const char * src_row = src + head * src_nb2 + abs_row * src_nb1;
+    const int blk_idx  = j / QK_TURBO4;
+    const int j_in_blk = j % QK_TURBO4;
+    const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+
+    int bit_offset = j_in_blk * 3;
+    int byte_idx = bit_offset / 8;
+    int bit_pos = bit_offset % 8;
+    uint16_t raw = (uint16_t)blk->qs[byte_idx];
+    if (byte_idx + 1 < 48) raw |= (uint16_t)blk->qs[byte_idx + 1] << 8;
+    uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
+
+    float val = C[idx] * norm;
+
+    dst[head * dst_head_stride + abs_row * dst_row_stride + j] = __float2half(val);
+}
+
+struct turbo_fp16_shadow {
+    half *   buf       = nullptr;
+    int64_t  capacity  = 0;
+    int64_t  filled    = 0;
+    int64_t  ne0       = 0;
+    int64_t  ne2       = 0;
+    void *   src_data  = nullptr;
+};
+
+static std::unordered_map<void *, turbo_fp16_shadow> g_turbo_shadows;
+
+static void turbo_shadow_sync(
+        const ggml_tensor * T, turbo_fp16_shadow & sh,
+        ggml_tensor & T_f16, cudaStream_t stream) {
+
+    const int64_t ne0 = T->ne[0];
+    const int64_t ne1 = T->ne[1];
+    const int64_t ne2 = T->ne[2];
+
+    bool need_full = false;
+
+    if (sh.src_data != T->data || sh.ne0 != ne0 || sh.ne2 != ne2) {
+        need_full = true;
+    }
+    if (ne1 < sh.filled) {
+        need_full = true;
+    }
+
+    if (ne1 > sh.capacity || need_full) {
+        if (sh.buf) { CUDA_CHECK(cudaFree(sh.buf)); sh.buf = nullptr; }
+        int64_t new_cap = ne1 < 4096 ? 4096 : ne1 * 2;
+        const size_t sz = ne0 * new_cap * ne2 * sizeof(half);
+        CUDA_CHECK(cudaMalloc(&sh.buf, sz));
+        sh.capacity = new_cap;
+        sh.filled   = 0;
+        sh.ne0      = ne0;
+        sh.ne2      = ne2;
+        sh.src_data = T->data;
+        need_full   = true;
+    }
+
+    const int64_t row_start = need_full ? 0        : sh.filled;
+    const int64_t n_rows    = need_full ? ne1      : ne1 - sh.filled;
+
+    if (n_rows > 0) {
+        const int64_t dst_row_stride  = ne0;
+        const int64_t dst_head_stride = ne0 * sh.capacity;
+
+        // kernel: src_row = src + head * src_nb2 + abs_row * src_nb1
+        // Pass T->nb[1] and T->nb[2] in original order — the kernel parameters
+        // match the tensor view dimensions directly.
+        dim3 grid((int)n_rows, (int)ne2);
+        if (T->type == GGML_TYPE_TURBO4_0) {
+            k_turbo4_dequant_rows_f16<<<grid, (int)ne0, 0, stream>>>(
+                (const char *)T->data, sh.buf, ne0,
+                row_start, n_rows,
+                T->nb[1], T->nb[2],
+                dst_row_stride, dst_head_stride);
+        } else if (T->type == GGML_TYPE_TURBO2_0) {
+            k_turbo2_dequant_rows_f16<<<grid, (int)ne0, 0, stream>>>(
+                (const char *)T->data, sh.buf, ne0,
+                row_start, n_rows,
+                T->nb[1], T->nb[2],
+                dst_row_stride, dst_head_stride);
+        } else {
+            k_turbo3_dequant_rows_f16<<<grid, (int)ne0, 0, stream>>>(
+                (const char *)T->data, sh.buf, ne0,
+                row_start, n_rows,
+                T->nb[1], T->nb[2],
+                dst_row_stride, dst_head_stride);
+        }
+    }
+
+    sh.filled = ne1;
+
+    T_f16        = *T;
+    T_f16.type   = GGML_TYPE_F16;
+    T_f16.data   = sh.buf;
+    T_f16.nb[0]  = sizeof(half);
+    T_f16.nb[1]  = ne0 * sizeof(half);
+    T_f16.nb[2]  = ne0 * sh.capacity * sizeof(half);
+    T_f16.nb[3]  = ne0 * sh.capacity * ne2 * sizeof(half);
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -324,6 +522,22 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    // TurboQuant FA (always available)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+
+    // Asymmetric turbo3 K (shadowed to f16) + q8_0 V
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16, GGML_TYPE_Q8_0)
+
+    // Gemma4: head_dim=512 (cols_per_block=1 forced in kernel to stay within register limits)
+    // NOTE: no F16/F16 D=512 vec instance is compiled (target already routes plain
+    // fp16 D=512 through the MMA path); only the turbo3 D=512 instances exist.
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+
     GGML_ABORT("fatal error");
 }
 
@@ -349,6 +563,10 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+            return true;
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             return true;
         default:
             return false;
@@ -419,14 +637,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
-        case 512:
+        case 512: {
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            // Gemma4 (turbo3 KV, D=512): the native turbo vec kernel does not need
+            // the GQA-optimized MMA path, so only require gqa_opt_applies for the
+            // non-turbo D=512 case (which goes through ggml_cuda_flash_attn_ext_mma_f16).
+            const bool turbo_512 = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+                                     V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0);
+            if (!turbo_512 && !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+        }
         case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
@@ -441,7 +665,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        const bool turbo_k_mixed = ((K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0) &&
+            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0));
+        const bool f16_k_q8_v = (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0);
+        if (!turbo_k_mixed && !f16_k_q8_v) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -456,6 +685,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // TurboQuant: only the vec kernel has turbo dequant support (D up to 512 for Gemma4).
+    if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
+        K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
+        K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) {
+        const bool can_use_vector_kernel_turbo = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        if (can_use_vector_kernel_turbo) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -569,17 +809,87 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    GGML_UNUSED(Q);
+
+    const bool turbo_k = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+    const bool turbo_v = (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0);
+    const bool turbo_kv = turbo_k || turbo_v;
+
+    // For non-turbo types, go straight to the normal dispatch.
+    if (!turbo_kv) {
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+            case BEST_FATTN_KERNEL_NONE:
+                GGML_ABORT("fatal error");
+            case BEST_FATTN_KERNEL_TILE:
+                ggml_cuda_flash_attn_ext_tile(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_VEC:
+                ggml_cuda_flash_attn_ext_vec(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_MMA_F16:
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+                break;
+        }
+        return;
+    }
+
+    // Native turbo vec kernel (default) — handles all tensor layouts correctly via
+    // get_vec_dot_KQ<TURBO*_0>/get_dequantize_V<TURBO*_0> in fattn-common.cuh.
+    // The fp16 shadow cache below has a known V-dequant layout/stride bug (ported
+    // as-is from upstream for reference/testing) — set GGML_TURBO_SHADOW_CACHE=1 to
+    // opt into it instead of the native path.
+    static const bool turbo_shadow = (getenv("GGML_TURBO_SHADOW_CACHE") != nullptr);
+    if (!turbo_shadow) {
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+            case BEST_FATTN_KERNEL_NONE:
+                GGML_ABORT("fatal error");
+            case BEST_FATTN_KERNEL_TILE:
+                ggml_cuda_flash_attn_ext_tile(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_VEC:
+                ggml_cuda_flash_attn_ext_vec(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_MMA_F16:
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+                break;
+        }
+        return;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_tensor K_f16, V_f16;
+    ggml_tensor * dst_mod = dst;
+    ggml_tensor dst_copy = *dst;
+
+    if (turbo_k) {
+        turbo_fp16_shadow & shK = g_turbo_shadows[K->data];
+        turbo_shadow_sync(K, shK, K_f16, stream);
+        dst_copy.src[1] = &K_f16;
+        dst_mod = &dst_copy;
+    }
+    if (turbo_v) {
+        turbo_fp16_shadow & shV = g_turbo_shadows[V->data];
+        turbo_shadow_sync(V, shV, V_f16, stream);
+        dst_copy.src[2] = &V_f16;
+        dst_mod = &dst_copy;
+    }
+
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst_mod)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
-            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            ggml_cuda_flash_attn_ext_tile(ctx, dst_mod);
             break;
         case BEST_FATTN_KERNEL_VEC:
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec(ctx, dst_mod);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst_mod);
             break;
     }
 }

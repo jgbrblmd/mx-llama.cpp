@@ -238,7 +238,11 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
-#include "mmq-config-gfx906.cuh" // gfx906 wraps rdna2, must be included after it
+// Ported from upstream PR #27841: dedicated wave64 GCN tuning for every quant
+// type, not just the Q8_0/MXFP4 gfx906 already tunes below. gfx906.cuh's own
+// fallback is redirected here instead of rdna2 (which is wave32-tuned).
+#include "mmq-config-gcn.cuh"
+#include "mmq-config-gfx906.cuh" // gfx906 wraps gcn, must be included after it
 
 #undef CASE
 

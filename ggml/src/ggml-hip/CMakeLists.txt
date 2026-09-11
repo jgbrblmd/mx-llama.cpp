@@ -15,6 +15,12 @@ if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
     set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
 endif()
 
+# Ensure position-independent code for all HIP compilations (bug fix ported from
+# moriyasujapan's gfx906-turbo-gemma4 fork: arte-fact's original TurboQuant port
+# was missing -fPIC on HIP compiles).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIC")
+
 # CMake on Windows doesn't support the HIP language yet
 if (WIN32)
     set(CXX_IS_HIPCC TRUE)
@@ -61,6 +67,10 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh" "../ggml-cuda/q8_repack/*.cuh
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu" "../ggml-cuda/q8_repack/*.cu")
+
+# turbo-quant.cu: compile at -O1 to work around HIP compiler FWHT optimization bug on gfx906
+set_source_files_properties(../ggml-cuda/turbo-quant.cu PROPERTIES COMPILE_FLAGS "-O1")
+
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -80,6 +90,21 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+endif()
+
+# TurboQuant FA template instances (always compiled, regardless of GGML_CUDA_FA_ALL_QUANTS).
+# Guarded by "if (NOT GGML_CUDA_FA_ALL_QUANTS)" to avoid appending (and double-compiling)
+# these same files twice: when GGML_CUDA_FA_ALL_QUANTS is ON the blanket
+# "template-instances/fattn-vec*.cu" glob above already picks them up.
+if (NOT GGML_CUDA_FA_ALL_QUANTS)
+    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo2*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo3*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo4*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*f16-q8_0*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
 endif()
 
 ggml_add_backend_library(ggml-hip

@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/gfx906-sgemm.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -115,6 +116,7 @@ static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/turbo-quant.cuh"
 #include "ggml-cuda/tp-allreduce.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
@@ -2608,6 +2610,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+#ifdef GGML_USE_HIP
+    // gfx906 (MI50/MI60/Radeon VII) custom SGEMM: up to 2x faster than rocBLAS
+    // for small F32xF32 matmuls. Ported from iacopPBK/llama.cpp-gfx906.
+    // Restricted to the plain non-batched 2D case (matching cublasSgemm's own
+    // simple-path condition just above) and to shapes gfx906_sgemm_custom_dispatch
+    // was actually tuned/benchmarked for; it returns false outside those bounds
+    // so this always falls through to the normal dispatch chain otherwise.
+    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VEGA20 &&
+        src0->type == GGML_TYPE_F32 &&
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const int stride_src0 = (int) (nb01 / sizeof(float));
+        const int stride_src1 = (int) (nb11 / sizeof(float));
+        const int stride_dst  = (int) ne0;
+        if (gfx906_sgemm_custom_dispatch(
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+                (int) ne01, (int) ne11, (int) ne00,
+                stride_src0, stride_src1, stride_dst,
+                ctx.stream())) {
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
+
     if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
         ggml_cuda_mul_mat_repacked(ctx, src0, src1, dst);
         return;
@@ -3185,6 +3211,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
@@ -6413,6 +6442,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                         // 32-value sub-blocks. get_rows has a bounded path for a row that
@@ -6445,7 +6476,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -6734,8 +6766,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
-        case GGML_OP_SOLVE_TRI:
+        case GGML_OP_TURBO_WHT:
             return true;
+        case GGML_OP_SOLVE_TRI: {
+            // The fast custom kernel (solve_tri.cu) handles n<=64, k<=32 on any
+            // arch. Beyond that it falls back to cublasStrsmBatched (rocBLAS
+            // strsm on HIP), which has no precompiled kernel for gfx906 and
+            // crashes with hipErrorInvalidDeviceFunction
+            // (upstream ggml-org/llama.cpp#19972, #19442). Report unsupported so
+            // ggml's scheduler falls back to CPU instead of crashing - only
+            // reachable by Gated Delta Net / linear-attention models (Qwen3.5,
+            // Qwen3-Next, Kimi Linear) needing triangular solves past that size.
+            if (ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+                const int64_t n = op->src[0]->ne[0];
+                const int64_t k = op->src[1]->ne[0];
+                if (n > 64 || k > 32) {
+                    return false;
+                }
+            }
+            return true;
+        }
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

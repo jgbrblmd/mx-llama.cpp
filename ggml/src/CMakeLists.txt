@@ -207,6 +207,7 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turbo-quant.c
             gguf.cpp
             ../rocmfpx/rocmfpx.c
             ../rocmfpx/rocmfpx.h
