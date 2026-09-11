@@ -911,8 +911,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
             const uint8_t idx1 = (packed >> ((lj + 1) * 3)) & 0x7;
             const float k0 = cn[idx0] + ((signs >> lj) & 1 ? qjl_norm : -qjl_norm);
             const float k1 = cn[idx1] + ((signs >> (lj + 1)) & 1 ? qjl_norm : -qjl_norm);
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += k0 * __low2float(qv) + k1 * __high2float(qv);
+#else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
             sum += k0 * qf.x + k1 * qf.y;
+#endif // V_DOT2_F32_F16_AVAILABLE
         }
     }
     return sum;
