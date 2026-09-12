@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# jgbrblmd docker staging (regenerable via stage.sh, ~690MB binaries)
+jgbrblmd/docker/rocm/
+jgbrblmd/docker/llama/
